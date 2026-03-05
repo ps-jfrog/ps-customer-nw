@@ -1,0 +1,8 @@
+.git*
+.git/*
+bin
+bin/*
+*.DS_Store
+scripts-general-util
+scripts-general-util/*
+.*ignore
