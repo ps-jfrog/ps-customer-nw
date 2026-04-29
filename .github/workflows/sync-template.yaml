@@ -62,9 +62,14 @@ jobs:
       - name: Check if already up to date
         id: diff
         run: |
-          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+          # Histories are unrelated (template repos have no common ancestor),
+          # so merge-base will fail — fall back to tree comparison.
+          if git merge-base --is-ancestor FETCH_HEAD HEAD 2>/dev/null; then
             echo "up_to_date=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Already up to date with template ${TEMPLATE_REPO}@${TEMPLATE_REF}"
+          elif git diff --quiet FETCH_HEAD -- 2>/dev/null; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Tree identical to template ${TEMPLATE_REPO}@${TEMPLATE_REF}"
           else
             echo "up_to_date=false" >> "$GITHUB_OUTPUT"
           fi
@@ -79,7 +84,9 @@ jobs:
 
           git checkout -B "${PR_BRANCH}" "origin/${DEFAULT_BRANCH}"
 
-          if git merge FETCH_HEAD --no-edit \
+          # --allow-unrelated-histories is required because template repos
+          # produce a fresh commit history with no common ancestor.
+          if git merge FETCH_HEAD --no-edit --allow-unrelated-histories \
               -m "chore: sync with template (${MERGE_SHA:0:7})"; then
             echo "conflicts=false" >> "$GITHUB_OUTPUT"
           else
