@@ -19,7 +19,7 @@ permissions:
 env:
   # Set JF_URL or JF_NAME secret or var. Optionally, when using JF_NAME, you can specify JF_WORKSPACE_BASE_URL to override the name substititon pattern.
   JF_URL: ${{ secrets.JF_URL || vars.JF_URL || format(secrets.JF_WORKSPACE_BASE_URL || vars.JF_WORKSPACE_BASE_URL || 'https://{0}.jfrog.io/', secrets.JF_NAME || vars.JF_NAME) }}
-  JF_PROJECT: ${{ secrets.JF_PROJECT || vars.JF_PROJECT || '' }}
+  JF_PROJECT: ${{ secrets.JF_PROJECT || vars.JF_PROJECT || 'ps-jf' }}
   JF_OIDC_AUDIENCE: ${{ secrets.JF_OIDC_AUDIENCE || vars.JF_OIDC_AUDIENCE || format('{0}/{1}', github.server_url, github.repository_owner) }}
   JF_OIDC_PROVIDER: ${{ secrets.JF_OIDC_PROVIDER || vars.JF_OIDC_PROVIDER || 'ghc-ps-jfrog' }}
   JFROG_CLI_VERSION: ${{ vars.JFROG_CLI_VERSION || 'latest' }}
