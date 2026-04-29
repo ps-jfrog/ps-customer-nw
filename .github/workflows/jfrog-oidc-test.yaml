@@ -37,6 +37,7 @@ jobs:
         uses: jfrog/setup-jfrog-cli@v4
         env:
           JF_GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JF_PROJECT: 'ps-jf'
         with:
           version: ${{ env.JFROG_CLI_VERSION }}
           oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
