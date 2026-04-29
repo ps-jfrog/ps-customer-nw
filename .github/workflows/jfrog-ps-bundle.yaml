@@ -51,7 +51,7 @@ jobs:
         id: set-matrix
         shell: bash
         run: |
-          echo "JFROG_CLI_BUILD_NAME=${JFROG_CLI_BUILD_NAME#*/}" | sed 's/jfrog-cli-plugin-//' | sed 's/${{ github.repository }}//' >> $GITHUB_OUTPUT
+          echo "JFROG_CLI_BUILD_NAME=${JFROG_CLI_BUILD_NAME#*/}" | sed 's/jfrog-cli-plugin-//' | sed 's/${{ github.repository_owner }}\///' >> $GITHUB_OUTPUT
           export TAGS=$(git for-each-ref --format '%(refname:short)' refs/heads/ refs/tags/ | while read ref; do
             REF_SHA=$(git rev-parse "$ref")
             # echo "Checking $ref $REF_SHA"
@@ -84,6 +84,7 @@ jobs:
         uses: jfrog/setup-jfrog-cli@v4
         env:
           JF_GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JF_PROJECT: 'ps-jf'
         with:
           version: ${{ env.JFROG_CLI_VERSION }}
           oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
@@ -102,11 +103,27 @@ jobs:
         env:
           VERSION_ID: ${{ matrix.version }}
         run: direnv allow
+      - name: Create Scoped Token
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          version: ${{ env.JFROG_CLI_VERSION }}
+          oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
+          download-repository: ${{ env.JFROG_CLI_REMOTE }}
+          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
       - name: Upload Artifact
         env:
           VERSION_ID: v${{ matrix.version }}
           BUNDLE_NAME: ${{ needs.prepare-execution-matrix.outputs.name }}
-        run: jf rt u bin/output.zip "${BUNDLE_REPO}/${BUNDLE_NAME}/${VERSION_ID}/" --flat=false --explode --build-name="$JFROG_CLI_BUILD_NAME" --build-number="$JFROG_CLI_BUILD_NUMBER"
+        run: |
+          jf rt u bin/output.zip "${BUNDLE_REPO}/${BUNDLE_NAME}/${VERSION_ID}/" \
+            --flat=false \
+            --explode \
+            --build-name="$JFROG_CLI_BUILD_NAME" \
+            --build-number="$JFROG_CLI_BUILD_NUMBER" \
+            --server-id="${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}"
 
       # - name: Build Information
       #   run: |
