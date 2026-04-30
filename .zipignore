@@ -6,3 +6,4 @@ bin/*
 scripts-general-util
 scripts-general-util/*
 .*ignore
+output.zip

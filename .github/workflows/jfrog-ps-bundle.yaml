@@ -21,7 +21,7 @@ env:
   JFROG_CLI_PLUGINS_SERVER: ${{ secrets.JFROG_CLI_PLUGINS_SERVER || vars.JFROG_CLI_PLUGINS_SERVER || 'setup-jfrog-cli-server' }} # TODO: detect
   JFROG_CLI_PLUGINS_REPO: ${{ secrets.JFROG_CLI_PLUGINS_REPO || vars.JFROG_CLI_PLUGINS_REPO || 'jfrog-cli-plugins' }}
   DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY || vars.DOCKER_REGISTRY || 'releases-docker.jfrog.io/' }}
-  BUNDLE_REPO: "${{ secrets.BUNDLE_REPO || vars.BUNDLE_REPO || (secrets.JF_PROJECT || vars.JF_PROJECT || '') && format('{0}-ps-bundles', secrets.JF_PROJECT || vars.JF_PROJECT || '') || 'ps-bundles' }}"
+  BUNDLE_REPO: "${{ secrets.BUNDLE_REPO || vars.BUNDLE_REPO || (secrets.JF_PROJECT || vars.JF_PROJECT || '') && format('{0}-ps-bundles', secrets.JF_PROJECT || vars.JF_PROJECT || '') || '' }}"
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -93,7 +93,7 @@ jobs:
           custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}
       # https://github.com/actions/checkout
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
       # TODO: use exclusions from .zipignore
@@ -102,7 +102,9 @@ jobs:
       - name: Base Version
         env:
           VERSION_ID: ${{ matrix.version }}
-        run: . ./.envrc -live
+        run: |
+          direnv allow
+          direnv reload
       - name: Create Scoped Token
         uses: jfrog/setup-jfrog-cli@v4
         env:
@@ -115,19 +117,16 @@ jobs:
           custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
       - name: Upload Artifact
         env:
-          VERSION_ID: v${{ matrix.version }}
+          BUNDLE_BRANCH: v${{ matrix.version }}
           BUNDLE_NAME: ${{ needs.prepare-execution-matrix.outputs.name }}
+          JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
         run: |
-          jf rt u bin/output.zip "${BUNDLE_REPO}/${BUNDLE_NAME}/${VERSION_ID}/" \
-            --flat=false \
-            --explode \
-            --build-name="$JFROG_CLI_BUILD_NAME" \
-            --build-number="$JFROG_CLI_BUILD_NUMBER" \
-            --server-id="${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}"
+          export PATH="$PWD/.envrc.d:$PATH"
+          ps_bundle_upload
 
-      # - name: Build Information
-      #   run: |
-      #     jf rt bc
-      #     jf rt bce
-      #     jf rt bag
-      #     jf rt bp --detailed-summary=true
+      - name: Build Information
+        run: |
+          jf rt bc
+          jf rt bce
+          jf rt bag
+          jf rt bp --detailed-summary=true

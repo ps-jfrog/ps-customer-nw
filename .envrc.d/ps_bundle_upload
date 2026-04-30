@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+_ps_bundle_usage() {
+    cat <<'help'
+NAME
+    ps_bundle_upload - Upload the PS customer bundle to Artifactory
+
+SYNOPSIS
+    ps_bundle_upload [--print-branch]
+
+DESCRIPTION
+    Uploads bin/output.zip to:
+
+        ${BUNDLE_REPO}/${BUNDLE_NAME}/${BUNDLE_BRANCH}/
+
+    If BUNDLE_REPO is not set, the command uses ${JF_PROJECT}-ps-bundles
+    when JF_PROJECT is set. Otherwise, it tries to detect one local generic
+    repository ending in -ps-bundles.
+
+    If BUNDLE_BRANCH is not set and the working tree is dirty, the branch
+    defaults to:
+
+        <sha256-of-current-commit>-<whoami>
+
+OPTIONS
+    --print-branch    Print the resolved bundle branch and exit
+    --help, -h        Show this help message
+help
+}
+
+_ps_bundle_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | awk '{print $1}'
+    else
+        echo "Error: sha256sum or shasum is required to resolve a dirty bundle branch." >&2
+        return 1
+    fi
+}
+
+_ps_bundle_repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+_ps_bundle_default_name() {
+    local repo_root
+    repo_root="$(_ps_bundle_repo_root)"
+    basename "$repo_root" | sed 's/^jfrog-cli-plugin-//'
+}
+
+_ps_bundle_is_dirty() {
+    [ -n "$(git status --porcelain --untracked-files=normal 2>/dev/null)" ]
+}
+
+_ps_bundle_commit_checksum() {
+    local commit
+    commit="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || {
+        echo "Error: unable to resolve the current commit." >&2
+        return 1
+    }
+
+    git cat-file commit "$commit" | _ps_bundle_sha256
+}
+
+_ps_bundle_branch() {
+    if [ -n "${BUNDLE_BRANCH:-}" ]; then
+        printf '%s\n' "$BUNDLE_BRANCH"
+        return 0
+    fi
+
+    if _ps_bundle_is_dirty; then
+        printf '%s-%s\n' "$(_ps_bundle_commit_checksum)" "$(whoami)"
+        return 0
+    fi
+
+    echo "Error: BUNDLE_BRANCH is required when the working tree is clean." >&2
+    return 1
+}
+
+_ps_bundle_detect_repo() {
+    command -v jq >/dev/null 2>&1 || return 1
+    command -v jf >/dev/null 2>&1 || return 1
+
+    local repos
+    repos="$(jf rt curl -sS -XGET api/repositories 2>/dev/null | jq -r '
+        [.[] | select(.type == "LOCAL" and .packageType == "Generic" and (.key | endswith("-ps-bundles"))) | .key]
+        | if length == 1 then .[0] else empty end
+    ')" || return 1
+
+    [ -n "$repos" ] || return 1
+    printf '%s\n' "$repos"
+}
+
+_ps_bundle_repo() {
+    if [ -n "${BUNDLE_REPO:-}" ]; then
+        printf '%s\n' "$BUNDLE_REPO"
+        return 0
+    fi
+
+    if [ -n "${JF_PROJECT:-}" ]; then
+        printf '%s-ps-bundles\n' "$JF_PROJECT"
+        return 0
+    fi
+
+    if _ps_bundle_detect_repo; then
+        return 0
+    fi
+
+    echo "Error: BUNDLE_REPO is required when no bundle repository can be inferred." >&2
+    return 1
+}
+
+_ps_bundle_upload() {
+    local artifact bundle_repo bundle_name bundle_branch build_name build_number server_id target
+    local server_args=()
+
+    artifact="${BUNDLE_ARTIFACT:-bin/output.zip}"
+    bundle_repo="$(_ps_bundle_repo)"
+    bundle_name="${BUNDLE_NAME:-$(_ps_bundle_default_name)}"
+    bundle_branch="$(_ps_bundle_branch)"
+    build_name="${JFROG_CLI_BUILD_NAME:-$bundle_name}"
+    build_number="${JFROG_CLI_BUILD_NUMBER:-$bundle_branch}"
+    server_id="${JFROG_CLI_SERVER_ID:-}"
+
+    if [ -z "$server_id" ] && [ -n "${JFROG_CLI_PLUGINS_SERVER:-}" ] && [ -n "${JF_PROJECT:-}" ]; then
+        server_id="${JFROG_CLI_PLUGINS_SERVER}-${JF_PROJECT}"
+    fi
+
+    if [ -n "$server_id" ]; then
+        server_args+=(--server-id="$server_id")
+    fi
+
+    if [ ! -f "$artifact" ]; then
+        echo "Error: bundle artifact not found: $artifact" >&2
+        return 1
+    fi
+
+    target="${bundle_repo%/}/${bundle_name}/${bundle_branch}/"
+    echo "Uploading $artifact to $target"
+
+    jf rt u "$artifact" "$target" \
+        --flat=false \
+        --explode \
+        --build-name="$build_name" \
+        --build-number="$build_number" \
+        "${server_args[@]}"
+}
+
+case "${1:-}" in
+    --help|-h)
+        _ps_bundle_usage
+        ;;
+    --print-branch)
+        _ps_bundle_branch
+        ;;
+    "")
+        _ps_bundle_upload
+        ;;
+    *)
+        echo "Error: unknown option: $1" >&2
+        _ps_bundle_usage >&2
+        exit 1
+        ;;
+esac
