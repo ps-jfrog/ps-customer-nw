@@ -42,7 +42,7 @@ jobs:
         with:
           token: ${{ steps.generate_token.outputs.token }}
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Configure git identity
         run: |
@@ -113,7 +113,10 @@ jobs:
           MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
         run: |
           set -euo pipefail
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
           git push -u origin "${PR_BRANCH}" --force-with-lease
+          git config --global --unset-all url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf || true
 
           BODY=$(cat <<EOF
           Syncs this repository with the latest changes from the upstream template
