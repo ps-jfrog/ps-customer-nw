@@ -1,9 +1,7 @@
 .git*
 .git/*
-bin
-bin/*
+bin/output.zip
 *.DS_Store
 scripts-general-util
 scripts-general-util/*
 .*ignore
-output.zip
