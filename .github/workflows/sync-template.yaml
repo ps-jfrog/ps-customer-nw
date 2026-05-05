@@ -177,10 +177,14 @@ jobs:
           MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
         run: |
           set -euo pipefail
-          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
-          git push -u origin "${PR_BRANCH}" --force-with-lease
-          git config --global --unset-all url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf || true
+          # Push to an authenticated URL directly: checkout ran with
+          # persist-credentials:false (no creds on origin), and a single
+          # url.*.insteadOf can only rewrite one URL form at a time without
+          # `--add`. Embedding the token in the push URL avoids both pitfalls
+          # and doesn't mutate global git config on the runner.
+          git push --force-with-lease \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${PR_BRANCH}"
 
           BODY=$(cat <<EOF
           Syncs this repository with the latest changes from the upstream template
