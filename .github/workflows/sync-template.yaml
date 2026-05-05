@@ -90,14 +90,33 @@ jobs:
               -m "chore: sync with template (${MERGE_SHA:0:7})"; then
             echo "conflicts=false" >> "$GITHUB_OUTPUT"
           else
-            CONFLICTING=$(git diff --name-only --diff-filter=U)
+            # ls-files --unmerged is the authoritative source: it covers
+            # content conflicts (UU/AA/AU/UA) and deletion conflicts
+            # (DD/UD/DU), unlike `git diff --diff-filter=U` which misses
+            # paths absent from the working tree.
+            CONFLICTING=$(git ls-files --unmerged | awk '{print $4}' | sort -u)
             echo "conflicts=true" >> "$GITHUB_OUTPUT"
             {
               echo "conflicting_files<<DELIM"
               echo "$CONFLICTING"
               echo "DELIM"
             } >> "$GITHUB_OUTPUT"
+
+            # Stage content conflicts with their markers preserved for human
+            # review in the PR.
             git add -A
+
+            # `git add -A` cannot resolve deletion conflicts; force-remove
+            # any paths still flagged unmerged so the index is fully resolved
+            # and the merge commit can complete.
+            REMAINING=$(git ls-files --unmerged | awk '{print $4}' | sort -u)
+            if [ -n "${REMAINING}" ]; then
+              printf '%s\n' "${REMAINING}" | while IFS= read -r path; do
+                [ -z "${path}" ] && continue
+                git rm -f -- "${path}" >/dev/null 2>&1 || true
+              done
+            fi
+
             git commit --no-edit \
               -m "chore: sync with template (${MERGE_SHA:0:7}) [conflicts]"
           fi
