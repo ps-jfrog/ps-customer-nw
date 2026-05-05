@@ -38,19 +38,25 @@ jobs:
           token: ${{ steps.generate_token.outputs.token }}
           fetch-depth: 0
           submodules: true
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Sync & update submodules to latest remote
         shell: bash
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
           set -euo pipefail
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
           git submodule sync --recursive
           git submodule update --init --recursive
           git submodule update --remote --init --recursive
+          git config --global --unset-all url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf || true
 
       - name: Create Pull Request for submodule updates
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
+          token: ${{ steps.generate_token.outputs.token }}
           commit-message: 'chore: update submodule(s) to latest revisions'
           title: 'chore: update submodule(s)'
           body: |
