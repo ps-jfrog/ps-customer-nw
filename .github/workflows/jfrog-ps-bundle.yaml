@@ -139,6 +139,11 @@ jobs:
           ps_bundle_upload
 
       - name: Build Information
+        # Run even when the upload step failed so a build-info record (with
+        # whatever artifacts did succeed) is still published. setup-jfrog-cli's
+        # auto-publish only does `jf rt bp --dry-run` for the summary; this
+        # step is the only thing that actually persists build-info.
+        if: success() || failure()
         run: |
           jf rt bc
           jf rt bce
