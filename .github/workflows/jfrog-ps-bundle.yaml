@@ -118,7 +118,12 @@ jobs:
       - name: Base Version
         env:
           VERSION_ID: ${{ matrix.version }}
-        run: direnv allow && direnv reload
+        # `direnv reload` only flags the next shell-hook tick to re-evaluate
+        # — CI has no direnv hook, so the .envrc is never run and the bundle
+        # zip is never (re)built. `direnv exec . <cmd>` actively evaluates
+        # .envrc in this directory (running _build_zip and friends with all
+        # side effects, including bin/output.zip), then runs the command.
+        run: direnv allow . && direnv exec . true
       - name: Create Scoped Token
         uses: jfrog/setup-jfrog-cli@v4
         env:
