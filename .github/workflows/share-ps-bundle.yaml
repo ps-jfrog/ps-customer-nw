@@ -12,10 +12,10 @@ on:
         type: string
         default: ''
       expires-hours:
-        description: 'How long the signed download link stays valid, in hours.'
+        description: 'How long the download link / token stays valid, in hours. Capped by the platform (typically 1h for non-admin tokens).'
         required: false
         type: number
-        default: 24
+        default: 1
 env:
   JF_URL: ${{ secrets.JF_URL || vars.JF_URL || format(secrets.JF_WORKSPACE_BASE_URL || vars.JF_WORKSPACE_BASE_URL || 'https://{0}.jfrog.io/', secrets.JF_NAME || vars.JF_NAME) }}
   JF_PROJECT: ${{ secrets.JF_PROJECT || vars.JF_PROJECT || '' }}
@@ -67,72 +67,95 @@ jobs:
             echo "::error::BUNDLE_REPO is empty. Set BUNDLE_REPO or JF_PROJECT (org var/secret)." >&2
             exit 1
           fi
-          REPO_PATH="${BUNDLE_REPO}/${BUNDLE_NAME}/${BUNDLE_VERSION}/output.zip"
+          # The bundle is stored *exploded* under <repo>/<bundle>/<version>/.
+          # No single `output.zip` artifact exists; sharing zips the folder
+          # on-the-fly via Artifactory's archive endpoint.
+          FOLDER_PATH="${BUNDLE_REPO}/${BUNDLE_NAME}/${BUNDLE_VERSION}"
           echo "bundle_name=${BUNDLE_NAME}" >> "$GITHUB_OUTPUT"
-          echo "repo_path=${REPO_PATH}" >> "$GITHUB_OUTPUT"
+          echo "folder_path=${FOLDER_PATH}" >> "$GITHUB_OUTPUT"
 
-      - name: Verify artifact exists
+      - name: Verify bundle folder exists
         env:
-          REPO_PATH: ${{ steps.resolve.outputs.repo_path }}
+          FOLDER_PATH: ${{ steps.resolve.outputs.folder_path }}
         run: |
           set -euo pipefail
-          # Storage HEAD returns 200 only when the artifact exists. Surfaces
-          # 404 loudly instead of letting `api/signed/url` produce a useless
-          # signed URL pointing at nothing.
+          # Storage GET returns 200 for both files and folders. A 200 with a
+          # `children` array confirms the path is a published bundle version.
           STATUS=$(jf rt curl --server-id="${JFROG_CLI_PLUGINS_SERVER}-ps-jf" \
-            -s -o /dev/null -w '%{http_code}' \
-            -X GET "api/storage/${REPO_PATH}")
+            -s -o /tmp/storage.json -w '%{http_code}' \
+            -X GET "api/storage/${FOLDER_PATH}")
           if [ "$STATUS" != "200" ]; then
-            echo "::error::Artifact not found at ${REPO_PATH} (HTTP $STATUS). Did the bundle's CI build complete and upload output.zip?" >&2
+            echo "::error::Bundle folder not found at ${FOLDER_PATH} (HTTP $STATUS). Did the CI build for this version complete and upload?" >&2
+            exit 1
+          fi
+          # A directory listing without children means the folder was created
+          # but nothing was uploaded — surface that loudly instead of letting
+          # the recipient download an empty zip.
+          if ! jq -e '.children | length > 0' /tmp/storage.json >/dev/null; then
+            echo "::error::Folder ${FOLDER_PATH} exists but is empty." >&2
             exit 1
           fi
 
-      - name: Generate signed URL
-        id: sign
+      - name: Mint scoped download token
+        id: token
         env:
-          REPO_PATH: ${{ steps.resolve.outputs.repo_path }}
           EXPIRES_HOURS: ${{ inputs.expires-hours }}
         run: |
           set -euo pipefail
           EXPIRES_SECS=$((EXPIRES_HOURS * 3600))
-          PAYLOAD=$(printf '{"repo_path": "%s", "valid_for_secs": %d}' "$REPO_PATH" "$EXPIRES_SECS")
-          # api/signed/url returns the plain URL on success, or a JSON error envelope on failure.
-          URL=$(jf rt curl --server-id="${JFROG_CLI_PLUGINS_SERVER}-ps-jf" \
-            -s -X POST "api/signed/url" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
-          if [ -z "$URL" ] || [[ "$URL" != https://* ]]; then
-            echo "::error::Failed to generate signed URL." >&2
-            echo "$URL" >&2
+          # `jf atc` with no --groups / --grant-admin inherits the calling
+          # OIDC identity's effective permissions (scope `applied-permissions/user`).
+          # In this workflow that resolves to the per-repo bundle group, which
+          # has READ on `<repo>-ps-bundles:<bundle>/**`. So the resulting
+          # token can authenticate the archive download for *this* bundle and
+          # nothing else. Non-admin callers are capped at ~1h regardless of
+          # the requested value; we surface whatever the platform issued.
+          TOKEN_JSON=$(jf atc \
+            --server-id="${JFROG_CLI_PLUGINS_SERVER}-ps-jf" \
+            --expiry="$EXPIRES_SECS" \
+            --refreshable \
+            --audience='*@*')
+          TOKEN=$(printf '%s' "$TOKEN_JSON" | jq -r '.access_token')
+          ACTUAL_EXPIRES_IN=$(printf '%s' "$TOKEN_JSON" | jq -r '.expires_in // empty')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Failed to mint scoped access token." >&2
             exit 1
           fi
-          # Mask the JWT token portion in any further log output. The full URL
-          # is only written to the step summary, never to plain logs.
-          TOKEN_PART="${URL##*sig=}"
-          echo "::add-mask::${TOKEN_PART}"
-          # Persist for the summary step via a heredoc-protected file so the
-          # URL never lands in workflow logs.
-          printf '%s' "$URL" > "$RUNNER_TEMP/signed-url.txt"
-          chmod 600 "$RUNNER_TEMP/signed-url.txt"
-          echo "signed_url_path=$RUNNER_TEMP/signed-url.txt" >> "$GITHUB_OUTPUT"
-          echo "expires_secs=${EXPIRES_SECS}" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::${TOKEN}"
+          # Persist via a 600-perm file so the token never lands in logs;
+          # the summary step reads, uses, then deletes it.
+          printf '%s' "$TOKEN" > "$RUNNER_TEMP/share-token.txt"
+          chmod 600 "$RUNNER_TEMP/share-token.txt"
+          echo "token_path=$RUNNER_TEMP/share-token.txt" >> "$GITHUB_OUTPUT"
+          echo "expires_secs=${ACTUAL_EXPIRES_IN:-$EXPIRES_SECS}" >> "$GITHUB_OUTPUT"
+          echo "requested_secs=${EXPIRES_SECS}" >> "$GITHUB_OUTPUT"
 
       - name: Publish summary
         env:
           BUNDLE_NAME: ${{ steps.resolve.outputs.bundle_name }}
           BUNDLE_VERSION: ${{ inputs.version }}
-          REPO_PATH: ${{ steps.resolve.outputs.repo_path }}
+          FOLDER_PATH: ${{ steps.resolve.outputs.folder_path }}
           EXPIRES_HOURS: ${{ inputs.expires-hours }}
-          EXPIRES_SECS: ${{ steps.sign.outputs.expires_secs }}
-          SIGNED_URL_PATH: ${{ steps.sign.outputs.signed_url_path }}
+          EXPIRES_SECS: ${{ steps.token.outputs.expires_secs }}
+          REQUESTED_SECS: ${{ steps.token.outputs.requested_secs }}
+          TOKEN_PATH: ${{ steps.token.outputs.token_path }}
         run: |
           set -euo pipefail
-          URL=$(cat "$SIGNED_URL_PATH")
-          rm -f "$SIGNED_URL_PATH"
-          # Compute a friendly expiry timestamp (UTC).
+          TOKEN=$(cat "$TOKEN_PATH")
+          rm -f "$TOKEN_PATH"
+          # The "zip artifact" endpoint: streams a server-built zip of the
+          # exploded bundle folder. Auth is via Authorization header (the
+          # `?access_token=` query-param form is rejected on this endpoint).
+          ARCHIVE_URL="${JF_URL%/}/artifactory/api/archive/download/${FOLDER_PATH}?archiveType=zip"
+          # Compute a friendly expiry timestamp (UTC); fall back to relative.
           if EXPIRES_AT=$(date -u -d "+${EXPIRES_SECS} seconds" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null); then :
-          else EXPIRES_AT=$(date -u -v +"${EXPIRES_SECS}S" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "in ${EXPIRES_HOURS}h")
+          else EXPIRES_AT=$(date -u -v +"${EXPIRES_SECS}S" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "~${EXPIRES_SECS}s")
           fi
+          EXPIRES_NOTE=""
+          if [ "${REQUESTED_SECS}" != "${EXPIRES_SECS}" ]; then
+            EXPIRES_NOTE=" (platform capped from requested ${EXPIRES_HOURS}h)"
+          fi
+          ZIP_NAME="${BUNDLE_NAME}-${BUNDLE_VERSION}.zip"
           {
             echo "## Bundle Sharing Link"
             echo ""
@@ -140,23 +163,25 @@ jobs:
             echo "| --- | --- |"
             echo "| Bundle | \`${BUNDLE_NAME}\` |"
             echo "| Version | \`${BUNDLE_VERSION}\` |"
-            echo "| Path | \`${REPO_PATH}\` |"
-            echo "| Valid for | ${EXPIRES_HOURS}h (until ${EXPIRES_AT}) |"
+            echo "| Folder | \`${FOLDER_PATH}\` |"
+            echo "| Valid until | ${EXPIRES_AT}${EXPIRES_NOTE} |"
             echo ""
-            echo "### Signed URL"
-            echo ""
-            echo '> ⚠️ Anyone with this URL can download the bundle until it expires. Share over a secure channel.'
+            echo "### Archive URL"
             echo ""
             echo '```'
-            echo "$URL"
+            echo "${ARCHIVE_URL}"
             echo '```'
             echo ""
-            echo "### Download"
+            echo "### Download (one-liner)"
+            echo ""
+            echo '> WARNING: this command contains a short-lived bearer token scoped to this bundle only. Share via a secure channel.'
             echo ""
             echo '```sh'
-            echo "curl -fSL -o output.zip \"<paste-URL-here>\""
-            echo "unzip output.zip -d ~/jfrog-ps-bundle"
+            echo "curl -fSL -o ${ZIP_NAME} \\"
+            echo "  -H \"Authorization: Bearer ${TOKEN}\" \\"
+            echo "  \"${ARCHIVE_URL}\""
+            echo "unzip ${ZIP_NAME} -d ~/jfrog-ps-bundle"
             echo "cd ~/jfrog-ps-bundle && . ./.envrc -live"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Signed URL written to the run summary (sensitive — not logged)."
+          echo "Archive URL + signed curl command written to the run summary (token masked in logs)."
