@@ -118,7 +118,7 @@ jobs:
       - name: Base Version
         env:
           VERSION_ID: ${{ matrix.version }}
-        run: . ./.envrc -live
+        run: direnv reload
       - name: Create Scoped Token
         uses: jfrog/setup-jfrog-cli@v4
         env:

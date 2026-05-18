@@ -1,0 +1,162 @@
+name: Share JFrog PS Engagement Bundle
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Bundle version to share (e.g. v2026.19.02.5). Must be already published.'
+        required: true
+        type: string
+      bundle:
+        description: 'Bundle name override (defaults to <repo-name>).'
+        required: false
+        type: string
+        default: ''
+      expires-hours:
+        description: 'How long the signed download link stays valid, in hours.'
+        required: false
+        type: number
+        default: 24
+env:
+  JF_URL: ${{ secrets.JF_URL || vars.JF_URL || format(secrets.JF_WORKSPACE_BASE_URL || vars.JF_WORKSPACE_BASE_URL || 'https://{0}.jfrog.io/', secrets.JF_NAME || vars.JF_NAME) }}
+  JF_PROJECT: ${{ secrets.JF_PROJECT || vars.JF_PROJECT || '' }}
+  JF_OIDC_AUDIENCE: ${{ secrets.JF_OIDC_AUDIENCE || vars.JF_OIDC_AUDIENCE || format('{0}/{1}', github.server_url, github.repository_owner) }}
+  JF_OIDC_PROVIDER: ${{ secrets.JF_OIDC_PROVIDER || vars.JF_OIDC_PROVIDER || 'ghc-ps-jfrog' }}
+  JFROG_CLI_VERSION: ${{ vars.JFROG_CLI_VERSION || 'latest' }}
+  JFROG_CLI_LOG_TIMESTAMP: DATE_AND_TIME
+  JFROG_CLI_LOG_LEVEL: ${{ vars.JFROG_CLI_LOG_LEVEL || 'INFO' }}
+  JFROG_CLI_ENCRYPTION_KEY: ${{ secrets.JFROG_CLI_ENCRYPTION_KEY || 'ThisIsNotSecureSoSetTheValueNow' }}
+  JFROG_CLI_REMOTE: ${{ secrets.JFROG_CLI_REMOTE || vars.JFROG_CLI_REMOTE || 'jfrog-cli-remote' }}
+  JFROG_CLI_PLUGINS_SERVER: ${{ secrets.JFROG_CLI_PLUGINS_SERVER || vars.JFROG_CLI_PLUGINS_SERVER || 'setup-jfrog-cli-server' }}
+  BUNDLE_REPO: "${{ secrets.BUNDLE_REPO || vars.BUNDLE_REPO || (secrets.JF_PROJECT || vars.JF_PROJECT || '') && format('{0}-ps-bundles', secrets.JF_PROJECT || vars.JF_PROJECT || '') || '' }}"
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  share:
+    name: Generate signed sharing link
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_PROJECT: 'ps-jf'
+        with:
+          version: ${{ env.JFROG_CLI_VERSION }}
+          oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
+          download-repository: ${{ env.JFROG_CLI_REMOTE }}
+          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-ps-jf
+
+      - name: Resolve bundle path
+        id: resolve
+        env:
+          BUNDLE_VERSION: ${{ inputs.version }}
+          BUNDLE_NAME_INPUT: ${{ inputs.bundle }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BUNDLE_NAME_INPUT}" ]; then
+            BUNDLE_NAME="${BUNDLE_NAME_INPUT}"
+          else
+            BUNDLE_NAME="${GITHUB_REPOSITORY##*/}"
+            BUNDLE_NAME="${BUNDLE_NAME#jfrog-cli-plugin-}"
+          fi
+          if [ -z "${BUNDLE_REPO}" ]; then
+            echo "::error::BUNDLE_REPO is empty. Set BUNDLE_REPO or JF_PROJECT (org var/secret)." >&2
+            exit 1
+          fi
+          REPO_PATH="${BUNDLE_REPO}/${BUNDLE_NAME}/${BUNDLE_VERSION}/output.zip"
+          echo "bundle_name=${BUNDLE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "repo_path=${REPO_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify artifact exists
+        env:
+          REPO_PATH: ${{ steps.resolve.outputs.repo_path }}
+        run: |
+          set -euo pipefail
+          # Storage HEAD returns 200 only when the artifact exists. Surfaces
+          # 404 loudly instead of letting `api/signed/url` produce a useless
+          # signed URL pointing at nothing.
+          STATUS=$(jf rt curl --server-id="${JFROG_CLI_PLUGINS_SERVER}-ps-jf" \
+            -s -o /dev/null -w '%{http_code}' \
+            -X GET "api/storage/${REPO_PATH}")
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Artifact not found at ${REPO_PATH} (HTTP $STATUS). Did the bundle's CI build complete and upload output.zip?" >&2
+            exit 1
+          fi
+
+      - name: Generate signed URL
+        id: sign
+        env:
+          REPO_PATH: ${{ steps.resolve.outputs.repo_path }}
+          EXPIRES_HOURS: ${{ inputs.expires-hours }}
+        run: |
+          set -euo pipefail
+          EXPIRES_SECS=$((EXPIRES_HOURS * 3600))
+          PAYLOAD=$(printf '{"repo_path": "%s", "valid_for_secs": %d}' "$REPO_PATH" "$EXPIRES_SECS")
+          # api/signed/url returns the plain URL on success, or a JSON error envelope on failure.
+          URL=$(jf rt curl --server-id="${JFROG_CLI_PLUGINS_SERVER}-ps-jf" \
+            -s -X POST "api/signed/url" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          if [ -z "$URL" ] || [[ "$URL" != https://* ]]; then
+            echo "::error::Failed to generate signed URL." >&2
+            echo "$URL" >&2
+            exit 1
+          fi
+          # Mask the JWT token portion in any further log output. The full URL
+          # is only written to the step summary, never to plain logs.
+          TOKEN_PART="${URL##*sig=}"
+          echo "::add-mask::${TOKEN_PART}"
+          # Persist for the summary step via a heredoc-protected file so the
+          # URL never lands in workflow logs.
+          printf '%s' "$URL" > "$RUNNER_TEMP/signed-url.txt"
+          chmod 600 "$RUNNER_TEMP/signed-url.txt"
+          echo "signed_url_path=$RUNNER_TEMP/signed-url.txt" >> "$GITHUB_OUTPUT"
+          echo "expires_secs=${EXPIRES_SECS}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish summary
+        env:
+          BUNDLE_NAME: ${{ steps.resolve.outputs.bundle_name }}
+          BUNDLE_VERSION: ${{ inputs.version }}
+          REPO_PATH: ${{ steps.resolve.outputs.repo_path }}
+          EXPIRES_HOURS: ${{ inputs.expires-hours }}
+          EXPIRES_SECS: ${{ steps.sign.outputs.expires_secs }}
+          SIGNED_URL_PATH: ${{ steps.sign.outputs.signed_url_path }}
+        run: |
+          set -euo pipefail
+          URL=$(cat "$SIGNED_URL_PATH")
+          rm -f "$SIGNED_URL_PATH"
+          # Compute a friendly expiry timestamp (UTC).
+          if EXPIRES_AT=$(date -u -d "+${EXPIRES_SECS} seconds" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null); then :
+          else EXPIRES_AT=$(date -u -v +"${EXPIRES_SECS}S" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "in ${EXPIRES_HOURS}h")
+          fi
+          {
+            echo "## Bundle Sharing Link"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Bundle | \`${BUNDLE_NAME}\` |"
+            echo "| Version | \`${BUNDLE_VERSION}\` |"
+            echo "| Path | \`${REPO_PATH}\` |"
+            echo "| Valid for | ${EXPIRES_HOURS}h (until ${EXPIRES_AT}) |"
+            echo ""
+            echo "### Signed URL"
+            echo ""
+            echo '> ⚠️ Anyone with this URL can download the bundle until it expires. Share over a secure channel.'
+            echo ""
+            echo '```'
+            echo "$URL"
+            echo '```'
+            echo ""
+            echo "### Download"
+            echo ""
+            echo '```sh'
+            echo "curl -fSL -o output.zip \"<paste-URL-here>\""
+            echo "unzip output.zip -d ~/jfrog-ps-bundle"
+            echo "cd ~/jfrog-ps-bundle && . ./.envrc -live"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Signed URL written to the run summary (sensitive — not logged)."
