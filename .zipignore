@@ -1,0 +1,11 @@
+*.git*
+.git/*
+bin
+bin/*
+*.DS_Store
+bin/output.zip
+*.DS_Store
+scripts-general-util
+output.zip
+scripts-general-util/*
+.*ignore

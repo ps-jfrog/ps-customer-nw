@@ -1,0 +1,76 @@
+name: Test OIDC to JFrog
+on:
+  push:
+    paths:
+      - .github/workflows/jfrog-oidc-test.yaml
+  #   branches:
+  #     - main
+  #     - master
+  #     - trunk
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  id-token: write
+env:
+  # Set JF_URL or JF_NAME secret or var. Optionally, when using JF_NAME, you can specify JF_WORKSPACE_BASE_URL to override the name substititon pattern.
+  JF_URL: ${{ secrets.JF_URL || vars.JF_URL || format(secrets.JF_WORKSPACE_BASE_URL || vars.JF_WORKSPACE_BASE_URL || 'https://{0}.jfrog.io/', secrets.JF_NAME || vars.JF_NAME) }}
+  JF_PROJECT: ${{ secrets.JF_PROJECT || vars.JF_PROJECT || 'ps-jf' }}
+  JF_OIDC_AUDIENCE: ${{ secrets.JF_OIDC_AUDIENCE || vars.JF_OIDC_AUDIENCE || format('{0}/{1}', github.server_url, github.repository_owner) }}
+  JF_OIDC_PROVIDER: ${{ secrets.JF_OIDC_PROVIDER || vars.JF_OIDC_PROVIDER || 'ghc-ps-jfrog' }}
+  JFROG_CLI_VERSION: ${{ vars.JFROG_CLI_VERSION || 'latest' }}
+  JFROG_CLI_REMOTE: ${{ secrets.JFROG_CLI_REMOTE || vars.JFROG_CLI_REMOTE || 'jfrog-cli-remote' }}
+  JFROG_CLI_LOG_LEVEL: ${{ vars.JFROG_CLI_LOG_LEVEL || 'DEBUG' }} # DEBUG, INFO, WARN, ERROR
+  JFROG_CLI_LOG_TIMESTAMP: DATE_AND_TIME
+  JFROG_CLI_ENCRYPTION_KEY: ${{ secrets.JFROG_CLI_ENCRYPTION_KEY || 'ThisIsNotSecureSoSetTheValueNow' }}
+jobs:
+  publish:
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    name: Test OIDC Connection
+    steps:
+      # https://github.com/marketplace/actions/setup-jfrog-cli
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JF_PROJECT: 'ps-jf'
+        with:
+          version: ${{ env.JFROG_CLI_VERSION }}
+          oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
+          download-repository: ${{ env.JFROG_CLI_REMOTE }}
+      # https://github.com/actions/checkout
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Verify OIDC Connection
+        run: jf rt curl /api/repositories
+      # - name: Test OIDC export
+      #   run: |
+      #     chrbin() {
+      #       echo $(printf \\$(echo "ibase=2; obase=8; $1" | bc))
+      #     }
+      #     ordbin() {
+      #       a=$(printf '%d' "'$1")
+      #       b=$(echo "obase=2; $a" | bc)
+      #       printf '%08d' $b 
+      #     }
+      #     ascii2bin() {
+      #       echo -n $* | while IFS= read -r -n1 char
+      #       do
+      #         ordbin $char | tr -d '\n'
+      #         echo -n " "
+      #       done
+      #     }
+      #     bin2ascii() {
+      #       for bin in $*
+      #       do
+      #         chrbin $bin | tr -d '\n'
+      #       done
+      #     }
+      #     jf c export | ascii2bin

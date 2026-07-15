@@ -1,0 +1,4 @@
+[submodule "scripts-general-util"]
+	path = scripts-general-util
+	url = git@github.com:ps-jfrog/scripts-general-util.git
+	branch = main

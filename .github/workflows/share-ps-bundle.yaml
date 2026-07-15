@@ -1,0 +1,187 @@
+name: Share JFrog PS Engagement Bundle
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Bundle version to share (e.g. v2026.19.02.5). Must be already published.'
+        required: true
+        type: string
+      bundle:
+        description: 'Bundle name override (defaults to <repo-name>).'
+        required: false
+        type: string
+        default: ''
+      expires-hours:
+        description: 'How long the download link / token stays valid, in hours. Capped by the platform (typically 1h for non-admin tokens).'
+        required: false
+        type: number
+        default: 1
+env:
+  JF_URL: ${{ secrets.JF_URL || vars.JF_URL || format(secrets.JF_WORKSPACE_BASE_URL || vars.JF_WORKSPACE_BASE_URL || 'https://{0}.jfrog.io/', secrets.JF_NAME || vars.JF_NAME) }}
+  JF_PROJECT: ${{ secrets.JF_PROJECT || vars.JF_PROJECT || '' }}
+  JF_OIDC_AUDIENCE: ${{ secrets.JF_OIDC_AUDIENCE || vars.JF_OIDC_AUDIENCE || format('{0}/{1}', github.server_url, github.repository_owner) }}
+  JF_OIDC_PROVIDER: ${{ secrets.JF_OIDC_PROVIDER || vars.JF_OIDC_PROVIDER || 'ghc-ps-jfrog' }}
+  JFROG_CLI_VERSION: ${{ vars.JFROG_CLI_VERSION || 'latest' }}
+  JFROG_CLI_LOG_TIMESTAMP: DATE_AND_TIME
+  JFROG_CLI_LOG_LEVEL: ${{ vars.JFROG_CLI_LOG_LEVEL || 'INFO' }}
+  JFROG_CLI_ENCRYPTION_KEY: ${{ secrets.JFROG_CLI_ENCRYPTION_KEY || 'ThisIsNotSecureSoSetTheValueNow' }}
+  JFROG_CLI_REMOTE: ${{ secrets.JFROG_CLI_REMOTE || vars.JFROG_CLI_REMOTE || 'jfrog-cli-remote' }}
+  JFROG_CLI_PLUGINS_SERVER: ${{ secrets.JFROG_CLI_PLUGINS_SERVER || vars.JFROG_CLI_PLUGINS_SERVER || 'setup-jfrog-cli-server' }}
+  BUNDLE_REPO: "${{ secrets.BUNDLE_REPO || vars.BUNDLE_REPO || (secrets.JF_PROJECT || vars.JF_PROJECT || '') && format('{0}-ps-bundles', secrets.JF_PROJECT || vars.JF_PROJECT || '') || '' }}"
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  share:
+    name: Generate signed sharing link
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_PROJECT: 'ps-jf'
+        with:
+          version: ${{ env.JFROG_CLI_VERSION }}
+          oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
+          download-repository: ${{ env.JFROG_CLI_REMOTE }}
+          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-ps-jf
+
+      - name: Resolve bundle path
+        id: resolve
+        env:
+          BUNDLE_VERSION: ${{ inputs.version }}
+          BUNDLE_NAME_INPUT: ${{ inputs.bundle }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BUNDLE_NAME_INPUT}" ]; then
+            BUNDLE_NAME="${BUNDLE_NAME_INPUT}"
+          else
+            BUNDLE_NAME="${GITHUB_REPOSITORY##*/}"
+            BUNDLE_NAME="${BUNDLE_NAME#jfrog-cli-plugin-}"
+          fi
+          if [ -z "${BUNDLE_REPO}" ]; then
+            echo "::error::BUNDLE_REPO is empty. Set BUNDLE_REPO or JF_PROJECT (org var/secret)." >&2
+            exit 1
+          fi
+          # The bundle is stored *exploded* under <repo>/<bundle>/<version>/.
+          # No single `output.zip` artifact exists; sharing zips the folder
+          # on-the-fly via Artifactory's archive endpoint.
+          FOLDER_PATH="${BUNDLE_REPO}/${BUNDLE_NAME}/${BUNDLE_VERSION}"
+          echo "bundle_name=${BUNDLE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "folder_path=${FOLDER_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify bundle folder exists
+        env:
+          FOLDER_PATH: ${{ steps.resolve.outputs.folder_path }}
+        run: |
+          set -euo pipefail
+          # Storage GET returns 200 for both files and folders. A 200 with a
+          # `children` array confirms the path is a published bundle version.
+          STATUS=$(jf rt curl --server-id="${JFROG_CLI_PLUGINS_SERVER}-ps-jf" \
+            -s -o /tmp/storage.json -w '%{http_code}' \
+            -X GET "api/storage/${FOLDER_PATH}")
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Bundle folder not found at ${FOLDER_PATH} (HTTP $STATUS). Did the CI build for this version complete and upload?" >&2
+            exit 1
+          fi
+          # A directory listing without children means the folder was created
+          # but nothing was uploaded — surface that loudly instead of letting
+          # the recipient download an empty zip.
+          if ! jq -e '.children | length > 0' /tmp/storage.json >/dev/null; then
+            echo "::error::Folder ${FOLDER_PATH} exists but is empty." >&2
+            exit 1
+          fi
+
+      - name: Mint scoped download token
+        id: token
+        env:
+          EXPIRES_HOURS: ${{ inputs.expires-hours }}
+        run: |
+          set -euo pipefail
+          EXPIRES_SECS=$((EXPIRES_HOURS * 3600))
+          # `jf atc` with no --groups / --grant-admin inherits the calling
+          # OIDC identity's effective permissions (scope `applied-permissions/user`).
+          # In this workflow that resolves to the per-repo bundle group, which
+          # has READ on `<repo>-ps-bundles:<bundle>/**`. So the resulting
+          # token can authenticate the archive download for *this* bundle and
+          # nothing else. Non-admin callers are capped at ~1h regardless of
+          # the requested value; we surface whatever the platform issued.
+          TOKEN_JSON=$(jf atc \
+            --server-id="${JFROG_CLI_PLUGINS_SERVER}-ps-jf" \
+            --expiry="$EXPIRES_SECS" \
+            --refreshable \
+            --audience='*@*')
+          TOKEN=$(printf '%s' "$TOKEN_JSON" | jq -r '.access_token')
+          ACTUAL_EXPIRES_IN=$(printf '%s' "$TOKEN_JSON" | jq -r '.expires_in // empty')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Failed to mint scoped access token." >&2
+            exit 1
+          fi
+          echo "::add-mask::${TOKEN}"
+          # Persist via a 600-perm file so the token never lands in logs;
+          # the summary step reads, uses, then deletes it.
+          printf '%s' "$TOKEN" > "$RUNNER_TEMP/share-token.txt"
+          chmod 600 "$RUNNER_TEMP/share-token.txt"
+          echo "token_path=$RUNNER_TEMP/share-token.txt" >> "$GITHUB_OUTPUT"
+          echo "expires_secs=${ACTUAL_EXPIRES_IN:-$EXPIRES_SECS}" >> "$GITHUB_OUTPUT"
+          echo "requested_secs=${EXPIRES_SECS}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish summary
+        env:
+          BUNDLE_NAME: ${{ steps.resolve.outputs.bundle_name }}
+          BUNDLE_VERSION: ${{ inputs.version }}
+          FOLDER_PATH: ${{ steps.resolve.outputs.folder_path }}
+          EXPIRES_HOURS: ${{ inputs.expires-hours }}
+          EXPIRES_SECS: ${{ steps.token.outputs.expires_secs }}
+          REQUESTED_SECS: ${{ steps.token.outputs.requested_secs }}
+          TOKEN_PATH: ${{ steps.token.outputs.token_path }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(cat "$TOKEN_PATH")
+          rm -f "$TOKEN_PATH"
+          # The "zip artifact" endpoint: streams a server-built zip of the
+          # exploded bundle folder. Auth is via Authorization header (the
+          # `?access_token=` query-param form is rejected on this endpoint).
+          ARCHIVE_URL="${JF_URL%/}/artifactory/api/archive/download/${FOLDER_PATH}?archiveType=zip"
+          # Compute a friendly expiry timestamp (UTC); fall back to relative.
+          if EXPIRES_AT=$(date -u -d "+${EXPIRES_SECS} seconds" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null); then :
+          else EXPIRES_AT=$(date -u -v +"${EXPIRES_SECS}S" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo "~${EXPIRES_SECS}s")
+          fi
+          EXPIRES_NOTE=""
+          if [ "${REQUESTED_SECS}" != "${EXPIRES_SECS}" ]; then
+            EXPIRES_NOTE=" (platform capped from requested ${EXPIRES_HOURS}h)"
+          fi
+          ZIP_NAME="${BUNDLE_NAME}-${BUNDLE_VERSION}.zip"
+          {
+            echo "## Bundle Sharing Link"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Bundle | \`${BUNDLE_NAME}\` |"
+            echo "| Version | \`${BUNDLE_VERSION}\` |"
+            echo "| Folder | \`${FOLDER_PATH}\` |"
+            echo "| Valid until | ${EXPIRES_AT}${EXPIRES_NOTE} |"
+            echo ""
+            echo "### Archive URL"
+            echo ""
+            echo '```'
+            echo "${ARCHIVE_URL}"
+            echo '```'
+            echo ""
+            echo "### Download (one-liner)"
+            echo ""
+            echo '> WARNING: this command contains a short-lived bearer token scoped to this bundle only. Share via a secure channel.'
+            echo ""
+            echo '```sh'
+            echo "curl -fSL -o ${ZIP_NAME} \\"
+            echo "  -H \"Authorization: Bearer ${TOKEN}\" \\"
+            echo "  \"${ARCHIVE_URL}\""
+            echo "unzip ${ZIP_NAME} -d ~/jfrog-ps-bundle"
+            echo "cd ~/jfrog-ps-bundle && . ./.envrc -live"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Archive URL + signed curl command written to the run summary (token masked in logs)."

@@ -1,0 +1,241 @@
+name: Sync Template
+
+on:
+  schedule:
+    - cron: '0 7 * * 1' # Weekly on Mondays at 07:00 UTC
+  workflow_dispatch:
+    inputs:
+      template_ref:
+        description: 'Template branch or tag to sync from'
+        required: false
+        default: 'main'
+        type: string
+  push:
+    paths:
+      - '.github/workflows/sync-template.yaml'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  TEMPLATE_REPO: ${{ vars.TEMPLATE_REPO || 'ps-jfrog/ps-customer-template' }}
+  TEMPLATE_REF: ${{ inputs.template_ref || 'main' }}
+  PR_BRANCH: chore/sync-template
+
+jobs:
+  sync-template:
+    name: Sync from template
+    if: github.repository != (vars.TEMPLATE_REPO || 'ps-jfrog/ps-customer-template')
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: generate_token
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID || vars.ORG_APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY || secrets.ORG_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch template
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          git remote add template \
+            "https://x-access-token:${GH_TOKEN}@github.com/${TEMPLATE_REPO}.git" 2>/dev/null || \
+            git remote set-url template \
+            "https://x-access-token:${GH_TOKEN}@github.com/${TEMPLATE_REPO}.git"
+          git fetch template "${TEMPLATE_REF}"
+
+      - name: Check if already up to date
+        id: diff
+        run: |
+          # Histories are unrelated (template repos have no common ancestor),
+          # so merge-base will fail — fall back to tree comparison.
+          if git merge-base --is-ancestor FETCH_HEAD HEAD 2>/dev/null; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Already up to date with template ${TEMPLATE_REPO}@${TEMPLATE_REF}"
+          elif git diff --quiet FETCH_HEAD -- 2>/dev/null; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Tree identical to template ${TEMPLATE_REPO}@${TEMPLATE_REF}"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge template changes
+        if: steps.diff.outputs.up_to_date != 'true'
+        id: merge
+        run: |
+          set -euo pipefail
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          MERGE_SHA=$(git rev-parse FETCH_HEAD)
+
+          git checkout -B "${PR_BRANCH}" "origin/${DEFAULT_BRANCH}"
+
+          # --allow-unrelated-histories is required because template repos
+          # produce a fresh commit history with no common ancestor.
+          if git merge FETCH_HEAD --no-edit --allow-unrelated-histories \
+              -m "chore: sync with template (${MERGE_SHA:0:7})"; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            # ls-files --unmerged is the authoritative source: it covers
+            # content conflicts (UU/AA/AU/UA) and deletion conflicts
+            # (DD/UD/DU), unlike `git diff --diff-filter=U` which misses
+            # paths absent from the working tree.
+            UNMERGED=$(git ls-files --unmerged)
+            SUBMODULE_CONFLICTS=$(echo "$UNMERGED" \
+              | awk '$1 == "160000" {print $4}' | sort -u)
+            CONTENT_CONFLICTS=$(echo "$UNMERGED" \
+              | awk '$1 != "160000" {print $4}' | sort -u)
+
+            # Auto-resolve gitlink (submodule) conflicts before `git add -A`:
+            # the runner uses submodules:false to keep the job lean, so
+            # unmerged gitlinks have no checked-out commit and `git add`
+            # would fail with "does not have a commit checked out". Write
+            # the template's SHA (stage 3) straight into the index; if the
+            # template removed the submodule, drop the entry instead.
+            if [ -n "${SUBMODULE_CONFLICTS}" ]; then
+              printf '%s\n' "${SUBMODULE_CONFLICTS}" | while IFS= read -r submod; do
+                [ -z "${submod}" ] && continue
+                THEIR_SHA=$(echo "$UNMERGED" \
+                  | awk -v p="${submod}" \
+                    '$1 == "160000" && $3 == 3 && $4 == p {print $2}' \
+                  | head -n1)
+                if [ -n "${THEIR_SHA}" ]; then
+                  git update-index --cacheinfo "160000,${THEIR_SHA},${submod}"
+                else
+                  git rm --cached -- "${submod}" >/dev/null 2>&1 || true
+                fi
+              done
+            fi
+
+            if [ -n "${CONTENT_CONFLICTS}" ]; then
+              echo "conflicts=true" >> "$GITHUB_OUTPUT"
+              {
+                echo "conflicting_files<<DELIM"
+                echo "${CONTENT_CONFLICTS}"
+                echo "DELIM"
+              } >> "$GITHUB_OUTPUT"
+            else
+              echo "conflicts=false" >> "$GITHUB_OUTPUT"
+            fi
+
+            if [ -n "${SUBMODULE_CONFLICTS}" ]; then
+              {
+                echo "submodule_conflicts<<DELIM"
+                echo "${SUBMODULE_CONFLICTS}"
+                echo "DELIM"
+              } >> "$GITHUB_OUTPUT"
+            fi
+
+            # Stage content conflicts with their markers preserved for human
+            # review in the PR.
+            git add -A
+
+            # `git add -A` cannot resolve deletion conflicts; force-remove
+            # any paths still flagged unmerged so the index is fully resolved
+            # and the merge commit can complete.
+            REMAINING=$(git ls-files --unmerged | awk '{print $4}' | sort -u)
+            if [ -n "${REMAINING}" ]; then
+              printf '%s\n' "${REMAINING}" | while IFS= read -r path; do
+                [ -z "${path}" ] && continue
+                git rm -f -- "${path}" >/dev/null 2>&1 || true
+              done
+            fi
+
+            COMMIT_MSG="chore: sync with template (${MERGE_SHA:0:7})"
+            if [ -n "${CONTENT_CONFLICTS}" ]; then
+              COMMIT_MSG="${COMMIT_MSG} [conflicts]"
+            fi
+            git commit --no-edit -m "${COMMIT_MSG}"
+          fi
+
+          echo "merge_sha=${MERGE_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Push branch and open PR
+        if: steps.diff.outputs.up_to_date != 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          HAS_CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          CONFLICTING_FILES: ${{ steps.merge.outputs.conflicting_files }}
+          SUBMODULE_CONFLICTS: ${{ steps.merge.outputs.submodule_conflicts }}
+          MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
+        run: |
+          set -euo pipefail
+          # Push to an authenticated URL directly: checkout ran with
+          # persist-credentials:false (no creds on origin), and a single
+          # url.*.insteadOf can only rewrite one URL form at a time without
+          # `--add`. Embedding the token in the push URL avoids both pitfalls
+          # and doesn't mutate global git config on the runner.
+          git push --force-with-lease \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${PR_BRANCH}"
+
+          BODY=$(cat <<EOF
+          Syncs this repository with the latest changes from the upstream template
+          [\`${TEMPLATE_REPO}\`](https://github.com/${TEMPLATE_REPO}) at \`${MERGE_SHA:0:7}\`.
+          EOF
+          )
+
+          if [ "$HAS_CONFLICTS" = "true" ]; then
+            CONFLICT_LIST=$(echo "$CONFLICTING_FILES" | sed 's/^/- `/' | sed 's/$/ `/')
+            BODY=$(cat <<EOF
+          ${BODY}
+
+          > [!WARNING]
+          > **Merge conflicts detected.** The following files need manual resolution:
+          >
+          ${CONFLICT_LIST}
+          >
+          > Check out this branch locally, resolve the conflicts, and push.
+          EOF
+            )
+          fi
+
+          if [ -n "${SUBMODULE_CONFLICTS:-}" ]; then
+            SUBMODULE_LIST=$(echo "$SUBMODULE_CONFLICTS" | sed 's/^/- `/' | sed 's/$/ `/')
+            BODY=$(cat <<EOF
+          ${BODY}
+
+          > [!NOTE]
+          > **Submodule pointer conflicts auto-resolved to the template's revision:**
+          >
+          ${SUBMODULE_LIST}
+          >
+          > Override locally if you need to keep a different submodule SHA.
+          EOF
+            )
+          fi
+
+          EXISTING_PR=$(gh pr list --head "${PR_BRANCH}" --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "${EXISTING_PR:-}" ]; then
+            gh pr edit "$EXISTING_PR" --body "$BODY"
+            echo "::notice::Updated existing PR #${EXISTING_PR}"
+          else
+            gh pr create \
+              --title "chore: sync with upstream template" \
+              --body "$BODY" \
+              --head "${PR_BRANCH}" \
+              --label "dependencies,template-sync,automated-pr" || \
+            gh pr create \
+              --title "chore: sync with upstream template" \
+              --body "$BODY" \
+              --head "${PR_BRANCH}"
+          fi

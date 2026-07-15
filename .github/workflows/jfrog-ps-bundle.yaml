@@ -1,0 +1,156 @@
+name: Build JFrog PS Engagement Bundle
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+  workflow_dispatch:
+env:
+  JF_URL: ${{ secrets.JF_URL || vars.JF_URL || format(secrets.JF_WORKSPACE_BASE_URL || vars.JF_WORKSPACE_BASE_URL || 'https://{0}.jfrog.io/', secrets.JF_NAME || vars.JF_NAME) }}
+  JF_PROJECT: ${{ secrets.JF_PROJECT || vars.JF_PROJECT || '' }}
+  JF_OIDC_AUDIENCE: ${{ secrets.JF_OIDC_AUDIENCE || vars.JF_OIDC_AUDIENCE || format('{0}/{1}', github.server_url, github.repository_owner) }}
+  JF_OIDC_PROVIDER: ${{ secrets.JF_OIDC_PROVIDER || vars.JF_OIDC_PROVIDER || 'ghc-ps-jfrog' }}
+  JFROG_CLI_VERSION: ${{ vars.JFROG_CLI_VERSION || 'latest' }}
+  JFROG_CLI_LOG_TIMESTAMP: DATE_AND_TIME
+  JFROG_CLI_LOG_LEVEL: ${{ vars.JFROG_CLI_LOG_LEVEL || 'INFO' }} # DEBUG, INFO, WARN, ERROR
+  JFROG_CLI_ENCRYPTION_KEY: ${{ secrets.JFROG_CLI_ENCRYPTION_KEY || 'ThisIsNotSecureSoSetTheValueNow' }}
+  # https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context
+  JFROG_CLI_BUILD_NAME: "${{ github.repository }}"
+  JFROG_CLI_REMOTE: ${{ secrets.JFROG_CLI_REMOTE || vars.JFROG_CLI_REMOTE || 'jfrog-cli-remote' }}
+  JFROG_CLI_PLUGINS_SERVER: ${{ secrets.JFROG_CLI_PLUGINS_SERVER || vars.JFROG_CLI_PLUGINS_SERVER || 'setup-jfrog-cli-server' }} # TODO: detect
+  JFROG_CLI_PLUGINS_REPO: ${{ secrets.JFROG_CLI_PLUGINS_REPO || vars.JFROG_CLI_PLUGINS_REPO || 'jfrog-cli-plugins' }}
+  DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY || vars.DOCKER_REGISTRY || 'releases-docker.jfrog.io/' }}
+  BUNDLE_REPO: "${{ secrets.BUNDLE_REPO || vars.BUNDLE_REPO || (secrets.JF_PROJECT || vars.JF_PROJECT || '') && format('{0}-ps-bundles', secrets.JF_PROJECT || vars.JF_PROJECT || '') || '' }}"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+  actions: read
+jobs:
+  prepare-execution-matrix:
+    name: Release Tags Matrix
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Watch CalVer Workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WATCH_WORKFLOW: calver.yaml
+        run: |
+          RUN_ID=$(gh run list --workflow "$WATCH_WORKFLOW" --repo="${{ github.repository }}" --commit ${{ github.sha }} --limit 1 --json databaseId --jq '.[0].databaseId')
+          gh run watch "$RUN_ID" --repo="${{ github.repository }}" --exit-status
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Prepare Execution Matrix
+        id: set-matrix
+        shell: bash
+        run: |
+          echo "JFROG_CLI_BUILD_NAME=${JFROG_CLI_BUILD_NAME#*/}" | sed 's/jfrog-cli-plugin-//' | sed 's/${{ github.repository_owner }}\///' >> $GITHUB_OUTPUT
+          export TAGS=$(git for-each-ref --format '%(refname:short)' refs/heads/ refs/tags/ | while read ref; do
+            REF_SHA=$(git rev-parse "$ref")
+            # echo "Checking $ref $REF_SHA"
+
+            if [ "$REF_SHA" = "$GITHUB_SHA" ] && perl -e 'exit (shift =~ /^(\d+)\.(\d+)\.(\d+)(?:-([\w\d_.\/-]+?))?(?:\.(\d+))*?$/ ? 0 : 1)' "$ref"; then
+              echo "$ref" | tr '/' '-'
+              # echo "MATCH: $ref"
+            fi
+          done | jq -R -s -c 'split("\n")[:-1]')
+          echo "MATRIX=$TAGS" >> $GITHUB_OUTPUT
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.MATRIX }}
+      name: ${{ steps.set-matrix.outputs.JFROG_CLI_BUILD_NAME }}
+  execute-scripts:
+    needs: prepare-execution-matrix
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.prepare-execution-matrix.outputs.matrix) }}
+    name: Release
+    env:
+      JFROG_CLI_BUILD_NUMBER: ${{ github.run_number }}-${{ matrix.version }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.version }}
+      cancel-in-progress: true
+    steps:
+      # https://github.com/marketplace/actions/setup-jfrog-cli
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JF_PROJECT: 'ps-jf'
+        with:
+          version: ${{ env.JFROG_CLI_VERSION }}
+          oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
+          download-repository: ${{ env.JFROG_CLI_REMOTE }}
+          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}
+      - uses: actions/create-github-app-token@v3
+        id: generate_token
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID || vars.APP_CLIENT_ID || vars.ORG_APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY || secrets.ORG_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Trust GitHub SSH host keys
+        run: |
+          mkdir -p ~/.ssh
+          cat >> ~/.ssh/known_hosts <<'EOF'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          EOF
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: true
+      # TODO: use exclusions from .zipignore
+      - name: Install asdf & tools
+        uses: asdf-vm/actions/install@v4
+      - name: Base Version
+        env:
+          VERSION_ID: ${{ matrix.version }}
+        # `direnv reload` only flags the next shell-hook tick to re-evaluate
+        # — CI has no direnv hook, so the .envrc is never run and the bundle
+        # zip is never (re)built. `direnv exec . <cmd>` actively evaluates
+        # .envrc in this directory (running _build_zip and friends with all
+        # side effects, including bin/output.zip), then runs the command.
+        run: direnv allow . && direnv exec . true
+      - name: Create Scoped Token
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          version: ${{ env.JFROG_CLI_VERSION }}
+          oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
+          download-repository: ${{ env.JFROG_CLI_REMOTE }}
+          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
+      - name: Upload Artifact
+        env:
+          BUNDLE_BRANCH: v${{ matrix.version }}
+          BUNDLE_NAME: ${{ needs.prepare-execution-matrix.outputs.name }}
+          JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
+        run: |
+          export PATH="$PWD/.envrc.d:$PATH"
+          ps_bundle_upload
+
+      - name: Build Information
+        # Run even when the upload step failed so a build-info record (with
+        # whatever artifacts did succeed) is still published. setup-jfrog-cli's
+        # auto-publish only does `jf rt bp --dry-run` for the summary; this
+        # step is the only thing that actually persists build-info.
+        if: success() || failure()
+        run: |
+          jf rt bc
+          jf rt bce
+          jf rt bag
+          jf rt bp --detailed-summary=true

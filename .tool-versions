@@ -1,0 +1,5 @@
+terraform 1.14.5
+golang 1.26.2
+shellcheck 0.10.0
+shfmt 3.3.0
+direnv 2.36.0

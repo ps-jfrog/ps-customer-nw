@@ -1,0 +1,68 @@
+name: Update Submodules
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  update-submodules:
+    # Ensure this only executes when the workflow is on the default branch
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/trunk' || github.ref == 'refs/heads/master'
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: generate_token
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID || vars.ORG_APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY || secrets.ORG_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Trust GitHub SSH host keys
+        run: |
+          mkdir -p ~/.ssh
+          cat >> ~/.ssh/known_hosts <<'EOF'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          EOF
+
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+
+      - name: Sync & update submodules to latest remote
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          git submodule update --remote --init --recursive
+          git config --global --unset-all url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf || true
+
+      - name: Create Pull Request for submodule updates
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          commit-message: 'chore: update submodule(s) to latest revisions'
+          title: 'chore: update submodule(s)'
+          body: |
+            This PR updates submodule(s) to their latest remote revisions.
+          branch: chore/update-submodules
+          delete-branch: true
+          signoff: false
+          labels: dependencies, submodules, automated-pr
+          draft: false
