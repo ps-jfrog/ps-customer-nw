@@ -1,0 +1,30 @@
+---
+description: Read submodule Cursor rules before cross-cutting changes
+alwaysApply: true
+---
+
+# Consult submodule rules first
+
+This repo vendors shared trees as git submodules (`jfrog-helm-values`,
+`scripts-general-util`, …). Each submodule owns conventions for its
+paths. Project-wide rules live here (`ps-customer-template`) and sync
+to customer clones.
+
+Before a change that spans this repo and a submodule (compose labels
+plus `helm/` symlinks, sizing, OpenShift flavor, shared scripts):
+
+1. Read that submodule's `.cursor/rules/` (and README / AGENTS.md).
+2. Follow those rules inside the submodule. Do not copy or restate
+   them in this repo.
+3. Keep customer-repo rules to glue only: `helm/` stack, site files,
+   CI, `.envrc`.
+
+```text
+# BAD
+Add compose label naming to this repo's .cursor/rules and invent a
+label that mixes network policy with image pins.
+
+# GOOD
+Read jfrog-helm-values/.cursor/rules/single-concern-labels.mdc,
+add one label in the submodule, then symlink it from helm/.
+```
