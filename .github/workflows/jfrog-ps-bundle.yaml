@@ -53,7 +53,10 @@ jobs:
         run: |
           echo "JFROG_CLI_BUILD_NAME=${JFROG_CLI_BUILD_NAME#*/}" | sed 's/jfrog-cli-plugin-//' | sed 's/${{ github.repository_owner }}\///' >> $GITHUB_OUTPUT
           export TAGS=$(git for-each-ref --format '%(refname:short)' refs/heads/ refs/tags/ | while read ref; do
-            REF_SHA=$(git rev-parse "$ref")
+            # CalVer writes *annotated* tags, so `git rev-parse <tag>` yields the
+            # tag object's own sha and never equals GITHUB_SHA. Peel to the commit
+            # or the matrix silently resolves empty and nothing is ever published.
+            REF_SHA=$(git rev-parse "$ref^{commit}")
             # echo "Checking $ref $REF_SHA"
 
             if [ "$REF_SHA" = "$GITHUB_SHA" ] && perl -e 'exit (shift =~ /^(\d+)\.(\d+)\.(\d+)(?:-([\w\d_.\/-]+?))?(?:\.(\d+))*?$/ ? 0 : 1)' "$ref"; then
