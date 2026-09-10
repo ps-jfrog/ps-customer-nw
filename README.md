@@ -68,16 +68,45 @@ jf_curl GET /artifactory/api/repositories
 
 ## Contributing
 
-Clone this repository with submodules, or if you have cloned the repo without them, initialize them:
-
-```sh
-git submodule update --init
-```
-
 Install [direnv](https://direnv.net/).
 
 ```sh
 direnv allow
+```
+
+Evaluating `.envrc` resolves the shared components declared in
+[ps-bundle.deps.json](ps-bundle.deps.json) before it rebuilds
+[bin/output.zip](bin/output.zip), so there is no separate clone step.
+
+### Dependencies
+
+`ps-bundle.deps.json` lists the shared bundles this repository consumes. Each
+entry names a folder in the bundle repository, pins a `version` (an exact tag,
+or the literal `latest` to take the newest published one), and picks a `target`
+directory that defaults to `deps/<name>`:
+
+```json
+{
+  "deps": [
+    {
+      "name": "scripts-general-util",
+      "version": "v0.1.0",
+      "target": "scripts-general-util"
+    }
+  ]
+}
+```
+
+To move onto a newer shared component, edit its `version` and run `direnv
+reload`. `ps_bundle_resolve --print-plan` prints what the manifest currently
+resolves to without contacting Artifactory.
+
+`scripts-general-util` used to be a git submodule; it is now materialised from
+an Artifactory bundle on `direnv reload`. If you have a stale submodule
+checkout, convert it in place:
+
+```sh
+git submodule deinit -f scripts-general-util && rm -rf scripts-general-util .git/modules/scripts-general-util && direnv reload
 ```
 
 Link new scripts against the [.envrc.d](.envrc.d/):
