@@ -102,12 +102,13 @@ jobs:
       # TODO: use exclusions from .zipignore
       - name: Install asdf & tools
         uses: asdf-vm/actions/install@v4
-      # Must precede "Base Version": evaluating .envrc runs ps_bundle_resolve,
-      # which downloads from `<JF_PROJECT>-ps-bundles`. Only this server is
-      # scoped to that project — the first Setup step overrides JF_PROJECT to
-      # `ps-jf` for build-info — so the resolver has nothing to authenticate
-      # with until it exists.
-      - name: Create Scoped Token
+      # Evaluating .envrc runs ps_bundle_resolve, which reads from
+      # `<JF_PROJECT>-ps-bundles`; the first Setup step overrides JF_PROJECT to
+      # `ps-jf` for build-info, so its token cannot see that repo. Give the
+      # resolver its own server under a distinct id rather than reusing the
+      # upload token: that one is deliberately short-lived and is minted just
+      # before it is needed, so it must not be spent waiting on a download.
+      - name: Setup Bundle Reader
         uses: jfrog/setup-jfrog-cli@v4
         env:
           JF_GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -116,13 +117,11 @@ jobs:
           oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
           oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
           download-repository: ${{ env.JFROG_CLI_REMOTE }}
-          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
+          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-bundle-reader
       - name: Base Version
         env:
           VERSION_ID: ${{ matrix.version }}
-          # Pin the resolver to the bundle-repo server instead of letting it
-          # fall back to whichever config happens to be default here.
-          JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
+          JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-bundle-reader
         # `direnv reload` only flags the next shell-hook tick to re-evaluate
         # — CI has no direnv hook, so the .envrc is never run and the bundle
         # zip is never (re)built. `direnv exec . <cmd>` actively evaluates
@@ -135,6 +134,19 @@ jobs:
           # resolve or archive would otherwise stay silent until the upload
           # step died with a confusing "command not found".
           test -s bin/output.zip
+      # Stays immediately before the upload, and therefore the last server
+      # configured, so both the upload and the build-info publish that follows
+      # run against a freshly minted token.
+      - name: Create Scoped Token
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          version: ${{ env.JFROG_CLI_VERSION }}
+          oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
+          download-repository: ${{ env.JFROG_CLI_REMOTE }}
+          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
       - name: Upload Artifact
         env:
           BUNDLE_BRANCH: v${{ matrix.version }}
