@@ -112,6 +112,9 @@ jobs:
         uses: jfrog/setup-jfrog-cli@v4
         env:
           JF_GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # See "Create Scoped Token" below: JF_PROJECT must be empty for the
+          # exchange to reach the per-repo bundle mapping at all.
+          JF_PROJECT: ''
         with:
           version: ${{ env.JFROG_CLI_VERSION }}
           oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
@@ -141,17 +144,32 @@ jobs:
         uses: jfrog/setup-jfrog-cli@v4
         env:
           JF_GIT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # setup-jfrog-cli forwards JF_PROJECT as `project_key` on the OIDC
+          # token exchange, and Artifactory filters candidate identity mappings
+          # by that project_key *before* it orders them by priority. The
+          # per-repo bundle mapping carries no project_key, so any non-empty
+          # JF_PROJECT makes it ineligible and the exchange falls through to the
+          # org-wide project Contributor mapping instead. Contributor has no
+          # DELETE_OVERWRITE_REPOSITORY, so republishing a bundle over an
+          # existing path fails with "needs DELETE permission", and its 60s TTL
+          # (vs. the bundle mapping's 1800s) is what expired the build-info
+          # publish mid-job. Measured on ps-jfrog/ps-customer-template:
+          #   project_key=""         -> groups:"<repo bundle group>"   ttl 1800
+          #   project_key="ps-jfrog" -> roles:ps-jfrog:"Contributor"   ttl 60
+          JF_PROJECT: ''
         with:
           version: ${{ env.JFROG_CLI_VERSION }}
           oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
           oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
           download-repository: ${{ env.JFROG_CLI_REMOTE }}
-          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
+          # Deliberately not derived from JF_PROJECT: the step-level override
+          # above would otherwise rename this server out from under the upload.
+          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-bundle-writer
       - name: Upload Artifact
         env:
           BUNDLE_BRANCH: v${{ matrix.version }}
           BUNDLE_NAME: ${{ needs.prepare-execution-matrix.outputs.name }}
-          JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
+          JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-bundle-writer
         run: |
           export PATH="$PWD/.envrc.d:$PATH"
           ps_bundle_upload
