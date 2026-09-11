@@ -102,12 +102,32 @@ reload`. `ps_bundle_resolve --print-plan` prints what the manifest currently
 resolves to without contacting Artifactory.
 
 `scripts-general-util` used to be a git submodule; it is now materialised from
-an Artifactory bundle on `direnv reload`. If you have a stale submodule
-checkout, convert it in place:
+an Artifactory bundle on `direnv reload`. A repository still on the submodule
+model needs converting before it can sync with this template — deinitialising
+the submodule by hand leaves the `.gitmodules` entry, the gitlink and the
+`.zipignore` exclusions behind, which puts the repo on both models at once.
+
+Run the **Migrate From Submodules** workflow on it (Actions → Migrate From
+Submodules → Run workflow), or do the same thing locally:
 
 ```sh
-git submodule deinit -f scripts-general-util && rm -rf scripts-general-util .git/modules/scripts-general-util && direnv reload
+.github/scripts/migrate-from-submodules.sh --dry-run   # see the plan
+.github/scripts/migrate-from-submodules.sh --template-dir /path/to/ps-customer-template
+direnv reload
 ```
+
+The conversion is idempotent and offline. Two things it deliberately does not
+do:
+
+- **Resolve the dependency.** That needs a bundle-reader token and a JFrog
+  identity mapping for the repository; without them `ps_bundle_resolve` reports
+  the dependency as missing and the `.envrc.d/*` links stay dangling.
+- **Make the next sync succeed.** Template-derived repos have unrelated
+  histories, so any file whose content has diverged — typically `.envrc`,
+  `README.md`, `.gitignore` and the bundle workflows — still merges as an
+  add/add conflict, and the sync guard aborts rather than committing markers.
+  Migrating first is what stops the repo ending up on both dependency models;
+  reconciling those files is a separate manual step.
 
 Link new scripts against the [.envrc.d](.envrc.d/):
 

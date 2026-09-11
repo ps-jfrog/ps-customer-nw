@@ -220,7 +220,14 @@ jobs:
               echo "moved to an Artifactory bundle dependency, so every shared"
               echo "file conflicts and the two models end up coexisting."
               echo
-              echo "**It needs a migration, not a sync.**"
+              echo "**It needs a migration, not a sync.** Run the"
+              echo "\`Migrate From Submodules\` workflow on this repository"
+              echo "(Actions → Migrate From Submodules → Run workflow), merge the"
+              echo "PR it opens, then re-run this sync."
+              echo
+              echo "If that workflow has not reached this repository yet, run"
+              echo "\`.github/scripts/migrate-from-submodules.sh\` from a local"
+              echo "clone of the template against a clone of this repo."
             else
               echo "Resolve the conflicts on a local checkout of"
               echo "\`${PR_BRANCH}\` and push, or fix the template."
