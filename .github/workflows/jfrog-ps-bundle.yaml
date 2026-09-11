@@ -137,9 +137,11 @@ jobs:
           # resolve or archive would otherwise stay silent until the upload
           # step died with a confusing "command not found".
           test -s bin/output.zip
-      # Stays immediately before the upload, and therefore the last server
-      # configured, so both the upload and the build-info publish that follows
-      # run against a freshly minted token.
+      # Stays immediately before the upload so its token is freshly minted when
+      # the upload spends it. Being last does *not* make it the default server:
+      # setup-jfrog-cli runs `jf config add --interactive=false`, which leaves
+      # the first-configured server as the default, so every step that needs
+      # this token has to name it via JFROG_CLI_SERVER_ID.
       - name: Create Scoped Token
         uses: jfrog/setup-jfrog-cli@v4
         env:
@@ -180,6 +182,14 @@ jobs:
         # auto-publish only does `jf rt bp --dry-run` for the summary; this
         # step is the only thing that actually persists build-info.
         if: success() || failure()
+        env:
+          # Without this, `jf` falls back to the default server -- the one the
+          # first Setup step configured, whose org-wide Contributor token lives
+          # for 60s. By the time the job reaches build-info (a couple of minutes
+          # in) that token is dead and `jf rt bp` 401s with "Token failed
+          # verification: expired". The bundle-writer token lasts 1800s and its
+          # group already carries the build-info permission.
+          JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-bundle-writer
         run: |
           jf rt bc
           jf rt bce
