@@ -1,0 +1,190 @@
+name: Migrate From Submodules
+
+# One-shot conversion of a customer repository from the git-submodule
+# dependency model to the ps-bundle artifact model.
+#
+# Deliberately NOT folded into Sync Template. Migration is a destructive,
+# once-per-repository change of repository shape; sync is an unattended weekly
+# job. Leaving them separate means the cron can never restructure eleven
+# repositories on its own, a bug in the migration cannot latch sync, and the
+# operator sees a single reviewable PR that does one thing. Sync's abort
+# message points here when it detects the old shape.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type the repository name (owner/name) to confirm'
+        required: true
+        type: string
+      dependency_version:
+        description: 'Version pin for ps-bundle.deps.json (tag, or "latest")'
+        required: false
+        default: 'latest'
+        type: string
+      dry_run:
+        description: 'Report the planned changes without opening a PR'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  TEMPLATE_REPO: ${{ vars.TEMPLATE_REPO || 'ps-jfrog/ps-customer-template' }}
+  TEMPLATE_REF: main
+  PR_BRANCH: chore/migrate-from-submodules
+  BOT_NAME: 'github-actions[bot]'
+  BOT_EMAIL: '41898282+github-actions[bot]@users.noreply.github.com'
+
+jobs:
+  migrate:
+    name: Migrate to bundle dependencies
+    if: github.repository != (vars.TEMPLATE_REPO || 'ps-jfrog/ps-customer-template')
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Confirm target
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.confirm }}" != "${GITHUB_REPOSITORY}" ]; then
+            echo "::error::Confirmation '${{ inputs.confirm }}' does not match ${GITHUB_REPOSITORY}."
+            exit 1
+          fi
+
+      - uses: actions/create-github-app-token@v3
+        id: generate_token
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID || vars.ORG_APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY || secrets.ORG_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+
+      - name: Configure git identity
+        run: |
+          git config user.name "${BOT_NAME}"
+          git config user.email "${BOT_EMAIL}"
+
+      # The migration script and the resolver live in the template. A repo that
+      # has never synced has neither, so fetch them into a side directory
+      # rather than assuming they are already checked out here.
+      - name: Fetch template tooling
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${TEMPLATE_REF}" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${TEMPLATE_REPO}.git" \
+            "${RUNNER_TEMP}/template"
+
+      - name: Migrate
+        id: migrate
+        run: |
+          set -euo pipefail
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          git checkout -B "${PR_BRANCH}" "origin/${DEFAULT_BRANCH}"
+
+          ARGS=(--version "${{ inputs.dependency_version }}" --template-dir "${RUNNER_TEMP}/template")
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+
+          "${RUNNER_TEMP}/template/.github/scripts/migrate-from-submodules.sh" "${ARGS[@]}" \
+            | tee "${RUNNER_TEMP}/migration.log"
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            {
+              echo "## Migration dry run"
+              echo
+              echo '```'
+              cat "${RUNNER_TEMP}/migration.log"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff --cached --quiet && git diff --quiet; then
+            echo "::notice::Repository is already on the bundle dependency model."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git add -A
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Guard - tree must be sane before committing
+        if: steps.migrate.outputs.changed == 'true'
+        run: "${RUNNER_TEMP}/template/.github/scripts/check-tree-sanity.sh"
+
+      - name: Commit
+        if: steps.migrate.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git commit -m "chore: migrate scripts-general-util from submodule to bundle dependency
+
+          Replaces the git submodule with a ps-bundle.deps.json entry resolved by
+          .envrc.d/ps_bundle_resolve. Materialising the dependency additionally
+          requires a bundle-reader token and a JFrog identity mapping."
+
+      - name: Push branch and open PR
+        if: steps.migrate.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/template/.github/scripts/push-bot-branch.sh" "${PR_BRANCH}"
+
+          BODY=$(cat <<'EOF'
+          Converts `scripts-general-util` from a git submodule to a bundle
+          dependency declared in `ps-bundle.deps.json`.
+
+          - `.gitmodules` entry and the `160000` gitlink removed
+          - `scripts-general-util` exclusions dropped from `.zipignore` — under the
+            artifact model its contents are what the bundle is meant to carry
+          - `/scripts-general-util/` and `/deps/` added to `.gitignore`
+          - `update-submodules.yaml` removed
+          - `.envrc.d/*` symlinks are unchanged and still point at
+            `../scripts-general-util/`, which the resolver now populates
+
+          > [!IMPORTANT]
+          > This makes the repository *structurally* correct — it is no longer on
+          > two dependency models at once. Two things it does **not** do:
+          >
+          > 1. **It does not resolve the dependency.** Downloading it needs a
+          >    bundle-reader token and a JFrog identity mapping for this
+          >    repository. Without them `ps_bundle_resolve` reports the dependency
+          >    as missing and the `.envrc.d/*` links stay dangling.
+          > 2. **It does not by itself make Sync Template succeed.** This
+          >    repository's `.envrc`, `README.md`, `.gitignore` and bundle
+          >    workflows diverged from the template long before the dependency
+          >    model changed, and template repos have unrelated histories, so
+          >    those files still merge as add/add conflicts. Sync will keep
+          >    aborting — correctly — until they are reconciled by hand.
+          EOF
+          )
+
+          EXISTING_PR=$(gh pr list --head "${PR_BRANCH}" --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "${EXISTING_PR:-}" ]; then
+            gh pr edit "$EXISTING_PR" --body "$BODY"
+            echo "::notice::Updated existing PR #${EXISTING_PR}"
+          else
+            gh pr create \
+              --title "chore: migrate from submodule to bundle dependency" \
+              --body "$BODY" \
+              --head "${PR_BRANCH}"
+          fi
