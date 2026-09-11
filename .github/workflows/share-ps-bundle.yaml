@@ -24,7 +24,10 @@ env:
   JFROG_CLI_VERSION: ${{ vars.JFROG_CLI_VERSION || 'latest' }}
   JFROG_CLI_LOG_TIMESTAMP: DATE_AND_TIME
   JFROG_CLI_LOG_LEVEL: ${{ vars.JFROG_CLI_LOG_LEVEL || 'INFO' }}
-  JFROG_CLI_ENCRYPTION_KEY: ${{ secrets.JFROG_CLI_ENCRYPTION_KEY || 'ThisIsNotSecureSoSetTheValueNow' }}
+  # The fallback must be exactly 32 bytes: `jf config add` encrypts the config
+  # with it and aborts on any other length with "Wrong length for master key",
+  # failing the very first Setup step. The previous literal was 31.
+  JFROG_CLI_ENCRYPTION_KEY: ${{ secrets.JFROG_CLI_ENCRYPTION_KEY || 'ThisIsNotSecureSoSetTheValueNow0' }}
   JFROG_CLI_REMOTE: ${{ secrets.JFROG_CLI_REMOTE || vars.JFROG_CLI_REMOTE || 'jfrog-cli-remote' }}
   JFROG_CLI_PLUGINS_SERVER: ${{ secrets.JFROG_CLI_PLUGINS_SERVER || vars.JFROG_CLI_PLUGINS_SERVER || 'setup-jfrog-cli-server' }}
   BUNDLE_REPO: "${{ secrets.BUNDLE_REPO || vars.BUNDLE_REPO || (secrets.JF_PROJECT || vars.JF_PROJECT || '') && format('{0}-ps-bundles', secrets.JF_PROJECT || vars.JF_PROJECT || '') || '' }}"
