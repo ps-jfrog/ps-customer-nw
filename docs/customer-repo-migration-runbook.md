@@ -340,6 +340,33 @@ it is what caught every real bug in this engagement:
 Never print raw tokens. Decode and print claim fields only (`groups`, `scope`,
 `exp`), and delete any probe artifact you upload.
 
+All four passed on the pilot, once provisioning caught up:
+
+| proof | evidence |
+| --- | --- |
+| publishes | `Uploading bin/output.zip to ps-jfrog-ps-bundles/ps-customer-gco/v2026.37.05/` |
+| republishes over the same path, differing content | the same `v2026.37.05/` path again one commit later, that time carrying `docs/customer-repo-migration-runbook.md` |
+| resolves the dependency | `scripts-general-util v2026.36.05.3 -> scripts-general-util/ (downloaded)`, then its files appear in the archive listing |
+| build-info | `Build info successfully deployed … buildRepo=artifactory-build-info` |
+
+### Getting a real republish without a contrived probe
+
+CalVer moves the **unsuffixed** day tag (`2026.37.05`) to the newest commit on
+the default branch, while `2026.37.05.N` is pinned per commit. So the bundle path
+`v<unsuffixed>` is republished with genuinely different content on every
+default-branch commit that day — that *is* the A/B, for free, with no throwaway
+artifact to clean up afterwards.
+
+Confirm it before trusting it:
+
+```sh
+git ls-remote --tags origin | grep -v '\^{}'   # unsuffixed tag should track the newest commit
+```
+
+Do not "test" republish by re-running the same workflow on the same commit: same
+tree, same exploded content, so it can pass without ever exercising
+`DELETE_OVERWRITE_REPOSITORY`.
+
 ### Provisioning prerequisites — check these before blaming the migration
 
 A migrated repo still needs repo variables before any of the four steps above
@@ -353,8 +380,41 @@ A fully provisioned repo looks like the template: `JF_NAME`, `JF_PROJECT`,
 `JFROG_CLI_VERSION`, `JFROG_CLI_REMOTE`, `JF_OIDC_PROVIDER`, plus an
 `APP_CLIENT_ID` variable or secret.
 
-On the pilot only `JF_NAME` and `JFROG_CLI_REMOTE` were set, so steps 1–4 could
-not be reached and were reported as blocked rather than passed.
+On the pilot, `JF_NAME`, `JFROG_CLI_REMOTE` and `JFROG_CLI_VERSION` were enough
+to get all four checks passing — `JF_PROJECT` was never set and turned out not to
+be required, because `ps_bundle_upload` derives the bundle repository itself
+(it published to `ps-jfrog-ps-bundles/ps-customer-gco/…` with `BUNDLE_REPO`
+empty). `JF_PROJECT` is still needed by `share-ps-bundle.yaml`, which fails fast
+with an explicit error when `BUNDLE_REPO` is empty.
+
+`APP_CLIENT_ID` is the one that stays blocking: without it `Sync Template` cannot
+mint an App token and fails on its first step. There is **no** org-level
+`ORG_APP_CLIENT_ID` to fall back on, so every unprovisioned repo has a
+permanently red `Sync Template` regardless of how well it is migrated.
+
+### Expect to be blocked twice, not once
+
+Two independent blockers stacked on the pilot, and the second was invisible until
+the first was cleared:
+
+1. no `JFROG_CLI_VERSION` → CLI download 500s on the `[RELEASE]` placeholder;
+2. once that was provisioned, the download succeeded and the **31-byte
+   `JFROG_CLI_ENCRYPTION_KEY` fallback** became the next error.
+
+Both fail in the same step (`Setup JFrog CLI`) with completely different causes,
+so re-read the log after clearing each one rather than assuming the step is
+"still failing for the same reason".
+
+That second one was a genuine template defect, found only because the pilot was
+driven all the way to green. It affected **7 of 11 repos** — every repo without
+the `JFROG_CLI_ENCRYPTION_KEY` secret (`gco`, `ks`, `pnc`, `asr`, `allstate`,
+`nw`, `gmit`) — and had been failing their nightly `Test OIDC to JFrog` schedule
+for months. It is fixed template-side now, so the remaining ten inherit the fix,
+but check that each one is actually on the current workflows:
+
+```sh
+grep -h 'JFROG_CLI_ENCRYPTION_KEY:' .github/workflows/*.yaml   # fallback must be 32 bytes
+```
 
 ## Per-repo failure modes hit, and how to tell them apart
 
@@ -365,6 +425,7 @@ step that touches `.envrc`, `ps_bundle_resolve` or `ps_bundle_upload`.
 | symptom | cause | migration defect? |
 | --- | --- | --- |
 | `Setup JFrog CLI`: `Downloading JFrog CLI from .../v2/[RELEASE]/... Unexpected HTTP response: 500` | no `JFROG_CLI_VERSION` variable, so it defaults to `latest` and the action requests the `[RELEASE]` placeholder through the `ps-jf-prod-cli` remote | **no** — provisioning |
+| `Setup JFrog CLI`: `cannot encrypt config: Wrong length for master key. Key should have a length of exactly: 32 bytes` | the template's `JFROG_CLI_ENCRYPTION_KEY` fallback was 31 bytes. Fixed template-side; a repo still on an older copy of the workflows will hit it | **no** — template defect, now fixed |
 | `BUNDLE_REPO` resolves empty, nothing to publish to | no `JF_PROJECT` variable | **no** — provisioning |
 | `create-github-app-token`: `The 'client-id' ... must be set to a non-empty string` | repo has the `APP_PRIVATE_KEY` secret but no `APP_CLIENT_ID` variable, and there is **no org-level `ORG_APP_CLIENT_ID`** to fall back on. This fails `Sync Template` on every unprovisioned repo | **no** — provisioning |
 | checkout fails authenticating an SSH submodule URL with the App token | `.gitmodules` uses `git@github.com:` and the App token cannot drive SSH. Migration **removes** this for `scripts-general-util`; a repo with other submodules still needs their URLs dealt with | fixed by migration for `scripts-general-util` only |
