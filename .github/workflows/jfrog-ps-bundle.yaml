@@ -172,6 +172,10 @@ jobs:
           BUNDLE_BRANCH: v${{ matrix.version }}
           BUNDLE_NAME: ${{ needs.prepare-execution-matrix.outputs.name }}
           JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-bundle-writer
+          # Must match the Build Information step below: the CLI keys its local
+          # build cache by project, so recording artifacts under one project and
+          # publishing under another yields an empty build-info.
+          JFROG_CLI_BUILD_PROJECT: ''
         run: |
           export PATH="$PWD/.envrc.d:$PATH"
           ps_bundle_upload
@@ -190,6 +194,17 @@ jobs:
           # verification: expired". The bundle-writer token lasts 1800s and its
           # group already carries the build-info permission.
           JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-bundle-writer
+          # The first Setup step exports JFROG_CLI_BUILD_PROJECT=ps-jf as a side
+          # effect of needing a ps-jf token to resolve the CLI plugin repo, which
+          # sends build-info to the project-owned `ps-jf-build-info`. A
+          # group-scoped token cannot deploy into a project's build-info repo
+          # even with an explicit permission target on it -- measured with a real
+          # bundle-group token:
+          #   JFROG_CLI_BUILD_PROJECT=ps-jf -> 403 "not permitted to deploy"
+          #   JFROG_CLI_BUILD_PROJECT=      -> "Build info successfully deployed"
+          # Clearing it publishes to the global artifactory-build-info repo,
+          # which the bundle group's `build` permission already covers.
+          JFROG_CLI_BUILD_PROJECT: ''
         run: |
           jf rt bc
           jf rt bce
