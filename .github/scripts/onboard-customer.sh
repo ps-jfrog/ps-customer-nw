@@ -35,6 +35,20 @@ APP_TOKEN="${APP_TOKEN:-}"
 JFROG_CLI_REMOTE="${JFROG_CLI_REMOTE:-ps-jf-prod-cli}"
 JFROG_CLI_VERSION="${JFROG_CLI_VERSION:-2.102.0}"
 
+# `BUNDLE_REPO` is derived from `JF_PROJECT` in the bundle workflow, and
+# onboarding must never set `JF_PROJECT` (see the "no JF_PROJECT" step). A
+# repository with neither computes an empty value and fails with
+# "BUNDLE_REPO is empty", so it is set explicitly.
+BUNDLE_REPO="${BUNDLE_REPO:-ps-jfrog-ps-bundles}"
+
+# Required org custom property, `require_explicit_values: true`, allowed values
+# Customer/Component/Solution/Document. Engagement repositories are Customer;
+# the org default is Solution, which is why it has to be passed explicitly.
+PS_DATA_CLASS="${PS_DATA_CLASS:-Customer}"
+
+# Branch the seeded history lands on. The template's default branch.
+SEED_BRANCH="${SEED_BRANCH:-main}"
+
 : "${GH_TOKEN:?GH_TOKEN is required}"
 
 MARKER="<!-- onboarding-state -->"
@@ -236,28 +250,89 @@ else
 fi
 
 # --- create repository ---------------------------------------------------
+# Deliberately NOT `POST /repos/{template}/generate`, for two independent
+# reasons. Either one alone would be enough; do not "simplify" this back.
+#
+# 1. It cannot work in this organisation at all. `ps_data_class` is a required
+#    org custom property with `require_explicit_values: true`, so every
+#    /generate call fails with "Repository Property 'ps_data_class' requires an
+#    explicit value to be set", and /generate has no parameter to supply one.
+#    Granting the App organisation administration would not change this.
+# 2. Even where it works, it produces a squashed `Initial commit` with **no
+#    shared history** with the template. With no merge base, every later sync is
+#    an unrelated-histories merge in which each file the template *modifies*
+#    (rather than merely adds) is an add/add conflict, and the fan-out aborts.
+#    `ps-customer-valero` was generated this way and syncs clean today only
+#    because template changes since have happened to be additive; the first
+#    modification to a shared file turns it into an aborting repository.
+#
+# `POST /orgs/{org}/repos` accepts `custom_properties`, and seeding by pushing
+# the template's real history gives the new repository a merge base on day one.
+# `ps-customer-bofa` was created that way and reports `up-to-date` against the
+# template rather than merely "clean".
 if [ "$REPO_EXISTS" = "true" ]; then
   step done "create repository" "[\`${TARGET}\`](https://github.com/${TARGET}) already exists — not touched"
 elif [ "$DRY_RUN" = "true" ]; then
-  step skipped "create repository" "would generate \`${TARGET}\` from \`${TEMPLATE_REPO}\` (dry run)"
+  step skipped "create repository" "would create \`${TARGET}\` via \`POST /orgs/${ORG}/repos\` with \`ps_data_class=${PS_DATA_CLASS}\`, then seed it with the template's history (dry run)"
 else
-  # POST /generate is an organisation-level write. Repository-scoped
-  # permissions never satisfy it, no matter how many are granted.
+  # Creating a repository in the org is an organisation-level write.
+  # Repository-scoped permissions never satisfy it, no matter how many are
+  # granted.
   if [ "$APP_OK" != "true" ]; then
     step blocked "create repository" "no usable App token"
     blocker "The App token could not be minted. Check \`vars.APP_CLIENT_ID\` and \`secrets.APP_PRIVATE_KEY\` on \`${TEMPLATE_REPO}\`."
-  elif out="$(GH_TOKEN="$APP_TOKEN" gh api --method POST \
-    "/repos/${TEMPLATE_REPO}/generate" \
-    -f owner="$ORG" -f name="$REPO_NAME" \
-    -f description="JFrog PS engagement — ${CUSTOMER_NAME}" \
-    -F private="$([ "$VISIBILITY" = private ] && echo true || echo false)" \
-    -F include_all_branches=false 2>&1)"; then
-    step done "create repository" "created [\`${TARGET}\`](https://github.com/${TARGET})"
+  elif out="$(GH_TOKEN="$APP_TOKEN" gh api --method POST "/orgs/${ORG}/repos" \
+    --input - <<<"$(jq -n \
+      --arg name "$REPO_NAME" \
+      --arg description "JFrog PS engagement — ${CUSTOMER_NAME}" \
+      --argjson private "$([ "$VISIBILITY" = private ] && echo true || echo false)" \
+      --arg data_class "$PS_DATA_CLASS" \
+      '{
+         name: $name,
+         description: $description,
+         private: $private,
+         # An empty repository is the point: the seed step below pushes the
+         # template history onto it, and auto_init would put an unrelated
+         # root commit in the way of exactly the merge base we are buying.
+         auto_init: false,
+         custom_properties: { ps_data_class: [$data_class] }
+       }')" 2>&1)"; then
+    step done "create repository" "created [\`${TARGET}\`](https://github.com/${TARGET}) with \`ps_data_class=${PS_DATA_CLASS}\`"
     REPO_EXISTS=true
   else
-    step blocked "create repository" "\`POST /repos/${TEMPLATE_REPO}/generate\` was refused"
+    step blocked "create repository" "\`POST /orgs/${ORG}/repos\` was refused"
     blocker "Creating a repository needs **Organization permissions -> Administration: write** on the App, granted at <https://github.com/organizations/${ORG}/settings/apps/jfrog-ps-customer-template/permissions>, then accepted for the installation. Repository-scoped permissions cannot substitute for it."
     echo "::warning::${out}"
+  fi
+fi
+
+# --- seed with the template's history -------------------------------------
+# Check-then-act on commit count, so a re-run after a partial onboarding
+# resumes instead of trying to push over engagement work. An empty repository
+# answers 409 on /commits, which is the case we want to act on.
+if [ "$REPO_EXISTS" != "true" ]; then
+  step skipped "seed history" "no repository yet"
+else
+  seed_commits="$(GH_TOKEN="${APP_TOKEN:-$GH_TOKEN}" \
+    gh api "/repos/${TARGET}/commits?per_page=1" --jq 'length' 2>/dev/null || echo 0)"
+  if [ "${seed_commits:-0}" != "0" ]; then
+    step done "seed history" "\`${TARGET}\` already has commits — not touched"
+  elif [ "$DRY_RUN" = "true" ]; then
+    step skipped "seed history" "would push the template's history to \`${TARGET}\` (dry run)"
+  elif [ "$(git rev-list --count HEAD 2>/dev/null || echo 1)" -le 1 ]; then
+    # A shallow checkout would push a single grafted commit — that is
+    # /generate's failure mode wearing a different hat. The workflow asks for
+    # fetch-depth: 0 precisely so this never silently degrades.
+    step failed "seed history" "this checkout has no history to push; the workflow needs \`fetch-depth: 0\`"
+  elif seed_out="$(git push --quiet \
+    "https://x-access-token:${APP_TOKEN}@github.com/${TARGET}.git" \
+    "HEAD:refs/heads/${SEED_BRANCH}" 2>&1)"; then
+    step done "seed history" \
+      "pushed $(git rev-list --count HEAD) commits of template history to \`${SEED_BRANCH}\`, so \`${TARGET}\` has a merge base with the template from day one"
+  else
+    step blocked "seed history" "cannot push to \`${TARGET}\`"
+    blocker "Seeding needs **Repository permissions -> Contents: write** on the App for \`${TARGET}\`. A repository the App created is normally added to the installation automatically; if it was created by hand, add it at <https://github.com/organizations/${ORG}/settings/installations>."
+    echo "::warning::${seed_out}"
   fi
 fi
 
@@ -288,9 +363,10 @@ set_var() {
 if [ "$REPO_EXISTS" != "true" ]; then
   step skipped "repository variables" "no repository yet"
 elif [ "$DRY_RUN" = "true" ]; then
-  step skipped "repository variables" "would set JF_NAME, JFROG_CLI_REMOTE, JFROG_CLI_VERSION, PREFERRED_RUNNER (dry run)"
+  step skipped "repository variables" "would set JF_NAME, JFROG_CLI_REMOTE, JFROG_CLI_VERSION, BUNDLE_REPO, PREFERRED_RUNNER (dry run)"
 else
-  wanted=("JF_NAME=${JF_NAME}" "JFROG_CLI_REMOTE=${JFROG_CLI_REMOTE}" "JFROG_CLI_VERSION=${JFROG_CLI_VERSION}")
+  wanted=("JF_NAME=${JF_NAME}" "JFROG_CLI_REMOTE=${JFROG_CLI_REMOTE}"
+    "JFROG_CLI_VERSION=${JFROG_CLI_VERSION}" "BUNDLE_REPO=${BUNDLE_REPO}")
   [ "$RUNNER" != "ubuntu-latest" ] && wanted+=("PREFERRED_RUNNER=${RUNNER}")
 
   ok=true
@@ -443,6 +519,11 @@ fi
 BODY_OUT+="
 ### What remains, always
 
+0. **Add \`${TARGET}\` to \`.github/sync-targets.json\` in \`${TEMPLATE_REPO}\`.**
+   Seeding with the template's history is what buys the merge base, but it also
+   means the repository carries no \`template_repository\` marker — and that
+   marker is how the fan-out discovers targets. Until it is listed under
+   \`include\`, this repository is never synced.
 1. **Review and merge the Terraform PR.** ${TF_PR_URL:-(not opened — see above)}
 2. **Wait for it to apply.** The group, bundle permission, build-info
    permission and OIDC identity mapping do not exist until then, and nothing

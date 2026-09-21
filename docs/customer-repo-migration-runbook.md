@@ -509,10 +509,28 @@ bank the reusable classification cheaply.
 
 Two things that will change the estimate materially, in opposite directions:
 
-- Provisioning every repo's variables first (`JFROG_CLI_VERSION`, `JF_PROJECT`,
-  `APP_CLIENT_ID`) turns the four end-to-end checks from "blocked" into real
-  verification. Without it, every repo lands with the same red checks the pilot
-  did and the token-scoping fix stays unproven per repo.
+- Provisioning every repo's variables first turns the four end-to-end checks
+  from "blocked" into real verification. Without it, every repo lands with the
+  same red checks the pilot did and the token-scoping fix stays unproven per
+  repo. The known-good set, measured on `ps-customer-bofa` and then on
+  `ps-customer-gco`, is `JF_NAME`, `JFROG_CLI_REMOTE`, `JFROG_CLI_VERSION`,
+  `PREFERRED_RUNNER` and `BUNDLE_REPO`.
+
+  Two of those are easy to get wrong in opposite directions:
+
+  - **Never set `JF_PROJECT`.** Artifactory filters candidate OIDC identity
+    mappings by `project_key` *before* applying priority, so any non-empty value
+    makes the per-repo priority-5 mapping ineligible and the exchange falls
+    through to an org-wide `Contributor` that lacks
+    `DELETE_OVERWRITE_REPOSITORY` and expires in 60 seconds. This is the single
+    defect that caused most of the pilot's failures.
+  - **Always set `BUNDLE_REPO` explicitly**, to `ps-jfrog-ps-bundles`. The
+    bundle workflow derives it from `JF_PROJECT`, so a repo that correctly has no
+    `JF_PROJECT` computes an empty value and fails with `BUNDLE_REPO is empty`.
+  - `APP_CLIENT_ID` is **no longer wanted** on a customer repo. The per-repo
+    `sync-template.yaml` that needed it is retired; the template fans the sync
+    out and holds the only App credential, so a customer repo needs no
+    credentials at all.
 - `medtronic` was identified by file fingerprint, not by a template marker. Treat
   its file provenance as unverified and diff it fully before adopting anything.
 
@@ -528,6 +546,24 @@ Two things that will change the estimate materially, in opposite directions:
   App token cannot authenticate.
 - **`mgm` and `ks` `.tool-versions`.** Genuinely customer-specific. Overwriting
   them from the template would downgrade engagement tooling.
+- **`ps-customer-valero` needs no migration, and is not in the tiering above.**
+  It is a 12th derived repository that earlier audits missed, generated from the
+  template on 2026-09-16 — after the artifact-dependency migration — so it has
+  `ps-bundle.deps.json`, no `.gitmodules` and no `scripts-general-util` gitlink.
+  There is nothing to migrate: it sits *below* the Easy tier at zero migration
+  hours. What it lacks is provisioning. It has **no repo variables at all** and
+  is **absent from `ps_engagement_repos`**, so it has no group, no bundle
+  permission and no OIDC identity mapping. It is also dormant — one `Initial
+  commit`, `pushed_at` equal to `created_at`, no engagement content — and every
+  one of its red checks is an `ubuntu-latest` billing rejection, which currently
+  masks the provisioning gap rather than revealing it.
+
+  The decision is therefore not "when do we migrate it" but "is this engagement
+  real": provision it like `bofa` (Terraform entry, then the five variables) or
+  retire the repository. Do not pick the third option of leaving it as-is — it
+  is a repo generated via `/generate`, so it has no merge base with the template
+  and will turn into an aborting sync target on the first template change that
+  modifies rather than adds to a shared file.
 
 ## Where this meets onboarding
 
