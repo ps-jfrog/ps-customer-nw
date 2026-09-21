@@ -528,3 +528,23 @@ Two things that will change the estimate materially, in opposite directions:
   App token cannot authenticate.
 - **`mgm` and `ks` `.tool-versions`.** Genuinely customer-specific. Overwriting
   them from the template would downgrade engagement tooling.
+
+## Where this meets onboarding
+
+Migration and onboarding are the two halves of the same fleet problem and they
+do not overlap in work, only in outcome. `docs/onboarding-issueops-proposal.md`
+covers repositories that do not exist yet; this runbook covers the ten that do
+and are on the wrong dependency model.
+
+Two connections worth knowing:
+
+- **The fan-out sync reports, it does not migrate.** A repository still on the
+  submodule model aborts with `aborted-conflict` and a message naming the
+  `Migrate From Submodules` workflow. That abort is the tree-sanity guard
+  working, not a defect, and it is the signal that this runbook applies.
+- **Phase B is what buys a merge base.** Until one sync merge is committed, a
+  derived repository shares no history with the template and every drifted file
+  merges as an add/add conflict. Onboarding sidesteps this for new repositories
+  by seeding them with the template's actual history; for existing ones, only
+  landing the first merge does it.
+

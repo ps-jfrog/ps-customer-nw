@@ -329,11 +329,13 @@ fi
 # --- Terraform PR --------------------------------------------------------
 TF_PR_URL=""
 tf_entry="\"${TARGET}\","
+# `.[0] | "\(.number) \(.url)"` renders "null null" for an empty list, which
+# reads as a found PR. Select the field and let jq's `// empty` do the work.
 existing_tf_pr="$(gh pr list --repo "$TF_REPO" --state open --search "ps-customer-${SLUG} in:title" \
-  --json number,url --jq '.[0] | "\(.number) \(.url)"' 2>/dev/null || true)"
+  --json url --jq '.[0].url // empty' 2>/dev/null || true)"
 
-if [ -n "${existing_tf_pr// /}" ]; then
-  TF_PR_URL="${existing_tf_pr#* }"
+if [ -n "${existing_tf_pr}" ]; then
+  TF_PR_URL="${existing_tf_pr}"
   step done "Terraform PR" "already open: ${TF_PR_URL}"
 elif [ "$DRY_RUN" = "true" ]; then
   step skipped "Terraform PR" "would add \`${tf_entry}\` to \`ps_engagement_repos\` in \`${TF_REPO}\` (dry run)"

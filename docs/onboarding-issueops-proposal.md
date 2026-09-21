@@ -1,7 +1,105 @@
-# Proposal: IssueOps customer onboarding from the template repo
+# Onboarding a customer engagement: proposal, and what was built
 
-Status: **proposal, uncommitted.** Written 2026-09-11. Open questions are
-marked and are genuinely open — this is not a finished spec.
+Status: **built and landed 2026-09-21.** The proposal below is kept because
+its analysis is still the reasoning behind the design; where reality
+contradicted it, this section says so rather than editing the contradiction
+away.
+
+## What changed between proposing and building
+
+The proposal's Phase 0 rests on creating org-level `ORG_APP_CLIENT_ID` and
+`ORG_APP_PRIVATE_KEY`. **There are no org-level secrets or variables available
+in this organisation and none can be created.** That is not a delay, it is a
+dead end, and it invalidates the single highest-leverage item in the document.
+
+So sync was inverted instead. The template is now the control plane: it holds
+the only App credential and pushes a sync branch and PR *into* each derived
+repository, which need no credentials at all. See
+`.github/workflows/fan-out-sync.yaml` and `.github/scripts/sync-one-repo.sh`.
+The per-repo `sync-template.yaml` is retired — it could never work in the ten
+repositories without credentials, and leaving it would have put two writers on
+the same bot branch in the three where it could.
+
+### What the App can actually do
+
+Measured, not assumed, from an installation token:
+
+| capability | verdict |
+| --- | --- |
+| push branches, open PRs in derived repos | **yes**, on the 7 of 12 it is installed on |
+| create a repository from the template | **no** — needs organisation `Administration: write` |
+| set Actions variables | **no** — needs repository `Variables: write` |
+| open a PR against `acrois-tf-oidc-bootstrap` | **no** — not installed on that repository |
+
+A separate and larger obstacle: `POST /repos/{owner}/{repo}/generate` fails
+org-wide with `Repository Property 'ps_data_class' requires an explicit value`,
+and that endpoint has no parameter for custom properties. **Granting the App
+organisation administration would not fix it.** `POST /orgs/{org}/repos` does
+accept `custom_properties`, so repository creation goes through that endpoint
+and then seeds content by pushing.
+
+### Seeding by pushing the template's history, not by `generate`
+
+This turned out to be better than the endpoint it replaced.
+`generate` produces a squashed `Initial commit` with **no shared history**, so
+every later sync is an unrelated-histories merge in which each drifted file is
+an add/add conflict. Measured on `ps-customer-valero`, generated from the
+template five days earlier: it syncs cleanly only because the template has made
+purely additive changes since, and the first modification to a shared file will
+turn it into an aborting repository.
+
+Pushing the template's real history instead gives the new repository a merge
+base on day one. `ps-customer-bofa`, created this way, reports `up-to-date`
+against the template rather than merely "clean".
+
+The cost is that such a repository carries no `template_repository` marker, so
+it is named in `.github/sync-targets.json` like the other pre-marker repos.
+
+### Two form fields the proposal wanted that this does not collect
+
+- **`project_key`.** The proposal collects it with "default must be blank".
+  Offering a field whose only correct value is empty is how the trap gets
+  sprung; it is not collected at all.
+- **Sizing and flavor.** The template has no `helm/` stack to symlink, so
+  nothing would consume them.
+
+### The variable the proposal missed
+
+`BUNDLE_REPO` is derived from `JF_PROJECT`, and onboarding must not set
+`JF_PROJECT`. A repository with neither therefore computes an empty
+`BUNDLE_REPO` and fails with `BUNDLE_REPO is empty` — which is exactly the
+state `ps-customer-gco` is in. New repositories get `BUNDLE_REPO` set
+explicitly instead.
+
+### Verification, and why it is deferred rather than run
+
+The identity mapping does not exist until the Terraform PR merges *and*
+applies, so the flow reports verification as skipped with its dependency named.
+Running it earlier would produce a red X meaning "waiting", which is the
+failure mode this document exists to remove.
+
+For `ps-customer-bofa` the sequence was run after
+[acrois-tf-oidc-bootstrap#52](https://github.com/ps-jfrog/acrois-tf-oidc-bootstrap/pull/52)
+applied: publish, republish over the same path with differing content,
+build-info. The mapping was read back from the Access API — priority 5, no
+`project_key`, 1800-second TTL, scoped to
+`applied-permissions/groups:"ghc-ps-jfrog-bundle-ps-customer-bofa"`.
+
+### Migration is still a separate job
+
+Onboarding produces repositories that are born correct. It does nothing for the
+ten that are not. Six of the seven repositories the fan-out can currently reach
+abort on sync, correctly, because they are still on the submodule model — see
+`docs/customer-repo-migration-runbook.md`, which owns that work. The fan-out's
+abort message names the `Migrate From Submodules` workflow for exactly this
+reason.
+
+---
+
+## The original proposal, 2026-09-11
+
+Written before the org-secret constraint was known. Open questions are marked
+and were genuinely open at the time.
 
 ## Why this document exists
 
@@ -34,7 +132,8 @@ assume a migration path exists, because there isn't one.
 These are ordinary fixes that the proposal depends on. Doing IssueOps first
 would just automate the creation of broken repos.
 
-1. **Org-level `ORG_APP_CLIENT_ID` / `ORG_APP_PRIVATE_KEY`.** Both
+1. **Org-level `ORG_APP_CLIENT_ID` / `ORG_APP_PRIVATE_KEY`.**
+   *(Superseded: impossible. Sync was inverted instead — see above.)* Both
    `sync-template.yaml` and `jfrog-ps-bundle.yaml` already fall back to them
    (`vars.APP_CLIENT_ID || vars.ORG_APP_CLIENT_ID`). The fallback has never
    resolved, which is why six repos fail at step 2 of every run. Setting the
