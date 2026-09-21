@@ -43,12 +43,12 @@ Without toolbox, the same download is:
 ```sh
 export PS_BUNDLE_NAME="ps-customer-<slug>"
 export PS_BUNDLE_VERSION=$(jf rt s --server-id=ps-bundle \
-  "ps-jf-ps-bundles/${PS_BUNDLE_NAME}/*" \
+  "ps-jfrog-ps-bundles/${PS_BUNDLE_NAME}/*" \
   --include-dirs --recursive=false 2>/dev/null \
   | jq -r ".[].path | split(\"/\")[-1]" | sort -V | tail -1)
 mkdir -p ~/jfrog-ps-bundle
 jf rt dl --server-id=ps-bundle --fail-no-op=true \
-  "ps-jf-ps-bundles/${PS_BUNDLE_NAME}/${PS_BUNDLE_VERSION}/(*)" \
+  "ps-jfrog-ps-bundles/${PS_BUNDLE_NAME}/${PS_BUNDLE_VERSION}/(*)" \
   "$HOME/jfrog-ps-bundle/{1}"
 ```
 
