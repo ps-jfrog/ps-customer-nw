@@ -41,6 +41,13 @@ on:
 permissions:
   contents: read
 
+# PREFERRED_RUNNER is honoured here for the same reason the rest of the fleet
+# honours it, plus one specific to right now: GitHub-hosted minutes are
+# suspended for this organisation over a billing failure, so every
+# `ubuntu-latest` job is rejected before it starts while the self-hosted
+# `standard` pool keeps running. Pinning to `ubuntu-latest` would make the
+# control plane unrunnable.
+
 # Two overlapping runs would race each other for the same bot branch in every
 # target. cancel-in-progress stays off: a cancelled run can be halfway through
 # a push, and the loser of that race is a target left with a branch and no PR.
@@ -56,7 +63,7 @@ jobs:
   discover:
     name: Discover targets
     if: github.repository == 'ps-jfrog/ps-customer-template'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
     outputs:
       targets: ${{ steps.pick.outputs.targets }}
       count: ${{ steps.pick.outputs.count }}
@@ -160,7 +167,7 @@ jobs:
     name: ${{ matrix.target }}
     needs: discover
     if: needs.discover.outputs.count != '0'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
     strategy:
       # One target's failure says nothing about the others. The fan-out is only
       # useful if it keeps going and reports per repository.
@@ -214,7 +221,7 @@ jobs:
     name: Report
     needs: [discover, sync]
     if: always() && github.repository == 'ps-jfrog/ps-customer-template'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
