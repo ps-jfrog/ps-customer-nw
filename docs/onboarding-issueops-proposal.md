@@ -296,7 +296,7 @@ App permissions needed:
 | Organization → Administration | write | create a repository in the org |
 | Repository → Administration | write | set visibility, topics, `delete_branch_on_merge` |
 | Repository → Contents | write | seed files, push the initial commit |
-| Repository → Actions variables | write | `JF_NAME`, `JF_OIDC_PROVIDER`, `PREFERRED_RUNNER` |
+| Repository → Actions variables | write | `JF_NAME`, `JFROG_CLI_REMOTE`, `JFROG_CLI_VERSION`, `BUNDLE_REPO`, `PREFERRED_RUNNER` — and never `JF_PROJECT` |
 | Repository → Secrets | write | only if per-repo secrets survive Phase 0 |
 | Repository → Administration (members) | write | add the engagement lead |
 | Repository → Pull requests | write | open the Terraform PR (Phase 5) |
@@ -304,12 +304,11 @@ App permissions needed:
 Two constraints worth stating plainly, because they are the usual reason this
 kind of automation fails on first run:
 
-- **Creating from a template needs org-level repo-creation rights.** The
-  `POST /repos/{template_owner}/{template_repo}/generate` endpoint is not
-  covered by repository-scoped permissions. The App must be granted
-  organisation administration, and the org must permit GitHub Apps to create
-  repositories. A repo-scoped installation token will 403 here no matter what
-  repository permissions it holds.
+- **Creating a repository needs org-level repo-creation rights.** `POST
+  /orgs/{org}/repos` is not covered by repository-scoped permissions. The App
+  must be granted organisation administration, and the org must permit GitHub
+  Apps to create repositories. A repo-scoped installation token will 403 here no
+  matter what repository permissions it holds.
 
 - **"Installed onto specific repos" and "creates repos in the org" are in
   tension.** Organisation-level permissions are installation-wide; they are not
@@ -327,8 +326,28 @@ kind of automation fails on first run:
 
 ### Seed commit
 
-After `generate`, push one commit that turns the generic template into this
-customer's repo:
+The repository is created empty and seeded by pushing the template's real
+history — not with `POST /repos/{template}/generate`. Two independent reasons,
+either of which is on its own sufficient; see "Seeding by pushing the template's
+history" above for the measurement:
+
+1. `/generate` cannot work in this organisation at all. `ps_data_class` is a
+   required org custom property with `require_explicit_values: true`, and
+   `/generate` has no parameter to supply one, so every call fails. Granting the
+   App organisation administration would not change that. `POST /orgs/{org}/repos`
+   does accept `custom_properties`.
+2. `/generate` produces a squashed `Initial commit` with no shared history, so
+   the repository has no merge base with the template and every file the
+   template later *modifies* is an add/add conflict. Measured on two local
+   repositories built to mirror each model: the `/generate` shape reports
+   `merge-base: none` and conflicts `AA` on the first modified shared file, while
+   the seeded shape has a merge base and merges clean.
+
+Because a seeded repository carries no `template_repository` marker, it must be
+added to `.github/sync-targets.json` under `include` or the fan-out will never
+discover it. The flow says so in its sticky comment.
+
+Then push one commit that turns the generic template into this customer's repo:
 
 - `ps-bundle.deps.json` — the chosen shared components, pinned to the currently
   published version rather than `latest`, so a new repo is reproducible;
