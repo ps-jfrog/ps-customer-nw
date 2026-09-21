@@ -56,6 +56,13 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # Full history, because onboarding seeds a new repository by pushing
+          # this checkout's history into it. At the default depth of 1 there is
+          # nothing to push but a grafted commit, which would hand the new
+          # repository the same "no merge base" problem that not using
+          # `POST /generate` exists to avoid. The seed step fails loudly rather
+          # than degrading if this is ever removed.
+          fetch-depth: 0
 
       - name: Resolve command
         id: cmd
