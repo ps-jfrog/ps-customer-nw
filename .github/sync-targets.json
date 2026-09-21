@@ -15,7 +15,8 @@
     "has ended or one being migrated by hand."
   ],
   "include": [
-    "ps-jfrog/ps-customer-medtronic"
+    "ps-jfrog/ps-customer-medtronic",
+    "ps-jfrog/ps-customer-bofa"
   ],
   "exclude": []
 }
