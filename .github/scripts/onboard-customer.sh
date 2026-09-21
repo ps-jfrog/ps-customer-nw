@@ -35,6 +35,12 @@ APP_TOKEN="${APP_TOKEN:-}"
 JFROG_CLI_REMOTE="${JFROG_CLI_REMOTE:-ps-jf-prod-cli}"
 JFROG_CLI_VERSION="${JFROG_CLI_VERSION:-2.102.0}"
 
+# `BUNDLE_REPO` is derived from `JF_PROJECT` in the bundle workflow, and
+# onboarding must never set `JF_PROJECT` (see the "no JF_PROJECT" step). A
+# repository with neither computes an empty value and fails with
+# "BUNDLE_REPO is empty", so it is set explicitly.
+BUNDLE_REPO="${BUNDLE_REPO:-ps-jfrog-ps-bundles}"
+
 : "${GH_TOKEN:?GH_TOKEN is required}"
 
 MARKER="<!-- onboarding-state -->"
@@ -288,9 +294,10 @@ set_var() {
 if [ "$REPO_EXISTS" != "true" ]; then
   step skipped "repository variables" "no repository yet"
 elif [ "$DRY_RUN" = "true" ]; then
-  step skipped "repository variables" "would set JF_NAME, JFROG_CLI_REMOTE, JFROG_CLI_VERSION, PREFERRED_RUNNER (dry run)"
+  step skipped "repository variables" "would set JF_NAME, JFROG_CLI_REMOTE, JFROG_CLI_VERSION, BUNDLE_REPO, PREFERRED_RUNNER (dry run)"
 else
-  wanted=("JF_NAME=${JF_NAME}" "JFROG_CLI_REMOTE=${JFROG_CLI_REMOTE}" "JFROG_CLI_VERSION=${JFROG_CLI_VERSION}")
+  wanted=("JF_NAME=${JF_NAME}" "JFROG_CLI_REMOTE=${JFROG_CLI_REMOTE}"
+    "JFROG_CLI_VERSION=${JFROG_CLI_VERSION}" "BUNDLE_REPO=${BUNDLE_REPO}")
   [ "$RUNNER" != "ubuntu-latest" ] && wanted+=("PREFERRED_RUNNER=${RUNNER}")
 
   ok=true
