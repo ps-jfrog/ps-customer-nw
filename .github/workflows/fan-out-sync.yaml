@@ -101,14 +101,16 @@ jobs:
         run: |
           set -euo pipefail
           gh api /installation/repositories --paginate \
-            --jq '.repositories[].full_name' | sort > /tmp/reachable.txt
+            --jq '.repositories[].full_name' | sort > "${RUNNER_TEMP}/reachable.txt"
+          echo "App is installed on:"
+          sed 's/^/  /' "${RUNNER_TEMP}/reachable.txt"
           {
             echo "## App installation"
             echo
             echo "The fan-out can only write to repositories this App is installed on."
             echo
             echo '```'
-            cat /tmp/reachable.txt
+            cat "${RUNNER_TEMP}/reachable.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -136,7 +138,7 @@ jobs:
               if [ "$marker" = "${TEMPLATE_REPO}" ]; then
                 derived+="${repo}"$'\n'
               fi
-            done < /tmp/reachable.txt
+            done < "${RUNNER_TEMP}/reachable.txt"
             candidates=$(printf '%s%s\n' "$derived" "$include" | grep . | sort -u)
           fi
 
@@ -147,7 +149,7 @@ jobs:
 
           # Naming an unreachable repository is an error worth surfacing now
           # rather than as thirteen identical clone failures later.
-          unreachable=$(comm -23 <(printf '%s\n' "$targets" | grep . || true) /tmp/reachable.txt || true)
+          unreachable=$(comm -23 <(printf '%s\n' "$targets" | grep . || true) "${RUNNER_TEMP}/reachable.txt" || true)
           if [ -n "$unreachable" ]; then
             echo "::warning::App is not installed on: $(echo "$unreachable" | tr '\n' ' ')"
           fi
@@ -202,19 +204,22 @@ jobs:
       - name: Record outcome
         if: always()
         run: |
-          mkdir -p /tmp/outcomes
+          # RUNNER_TEMP, not /tmp: self-hosted runners keep /tmp between jobs, so
+          # a shared path collects every other matrix leg's result and the
+          # summary reports each repository several times.
+          mkdir -p "${RUNNER_TEMP}/outcomes"
           slug=$(echo "${{ matrix.target }}" | tr '/' '_')
           printf '%s\t%s\t%s\n' \
             "${{ matrix.target }}" \
             "${{ steps.sync.outputs.outcome || 'error' }}" \
             "${{ steps.sync.outputs.detail || 'the sync step did not complete' }}" \
-            > "/tmp/outcomes/${slug}.tsv"
+            > "${RUNNER_TEMP}/outcomes/${slug}.tsv"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: outcome-${{ strategy.job-index }}
-          path: /tmp/outcomes/
+          path: ${{ runner.temp }}/outcomes/
           retention-days: 7
 
   report:
@@ -226,7 +231,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: outcome-*
-          path: /tmp/outcomes
+          path: ${{ runner.temp }}/outcomes
           merge-multiple: true
         continue-on-error: true
 
@@ -240,7 +245,7 @@ jobs:
             echo
             echo "| repository | outcome | detail |"
             echo "| --- | --- | --- |"
-            cat /tmp/outcomes/*.tsv 2>/dev/null |
+            cat "${RUNNER_TEMP}"/outcomes/*.tsv 2>/dev/null |
               sort |
               awk -F'\t' '{printf "| `%s` | %s | %s |\n", $1, $2, $3}'
             echo
@@ -252,7 +257,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Only a genuine error fails the run. Aborts are expected output.
-          if cat /tmp/outcomes/*.tsv 2>/dev/null | awk -F'\t' '$2 == "error"' | grep -q .; then
+          if cat "${RUNNER_TEMP}"/outcomes/*.tsv 2>/dev/null | awk -F'\t' '$2 == "error"' | grep -q .; then
             echo "::error::At least one target errored."
             exit 1
           fi
