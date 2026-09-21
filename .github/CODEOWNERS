@@ -1,0 +1,19 @@
+# Ownership of the template, and the allowlist the onboarding automation reads.
+#
+# `onboard-customer.sh` requires the actor to appear here *and* to hold write
+# access to this repository before it will create a repository or open a
+# Terraform pull request. Two checks rather than one, because they fail
+# differently: repository access is revoked when someone leaves, and this file
+# is what a reviewer reads to answer "who can do this".
+#
+# Handles, not teams, on purpose. Resolving team membership from Actions needs
+# the App to hold organisation `Members: read`, and adding a permission whose
+# only job is to check a permission is a poor trade for a list this short.
+
+* @acrois
+
+# Changing the onboarding automation must require the same trust as running it.
+/.github/CODEOWNERS               @acrois
+/.github/ISSUE_TEMPLATE/          @acrois
+/.github/scripts/                 @acrois
+/.github/workflows/               @acrois

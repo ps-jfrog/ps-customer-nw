@@ -1,0 +1,123 @@
+name: Onboard a customer engagement
+description: Create and provision a new ps-customer-* repository.
+title: 'onboard: ps-customer-<slug>'
+labels: [onboarding]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Filing this issue creates a repository and opens a Terraform pull
+        request. Only members of **PS-US-Engineering** listed in `CODEOWNERS`
+        can run it — anyone may file the request, but the automation checks
+        who triggered it, not who wrote it.
+
+        Progress is reported by editing a single comment on this issue. That
+        comment is the run's state: re-running resumes from it.
+
+  - type: input
+    id: customer_name
+    attributes:
+      label: Customer name
+      description: How the customer is referred to in writing. Used for the repository description.
+      placeholder: Bank of America
+    validations:
+      required: true
+
+  - type: input
+    id: slug
+    attributes:
+      label: Slug
+      description: >-
+        Lowercase letters, digits and hyphens, 2-29 characters, starting with a
+        letter or digit. The repository becomes `ps-customer-<slug>`, so a slug
+        of `bofa` produces `ps-customer-bofa`. The same string becomes the
+        Artifactory group name and the `<slug>/**` bundle path, so anything
+        outside `[a-z0-9-]` produces an unusable group.
+      placeholder: bofa
+    validations:
+      required: true
+
+  - type: dropdown
+    id: visibility
+    attributes:
+      label: Repository visibility
+      description: Customer engagements are private. Choose public only for a published reference.
+      options:
+        - private
+        - public
+      default: 0
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: shared
+    attributes:
+      label: Shared components
+      description: >-
+        Becomes the `ps-bundle.deps.json` entries for the new repository. Note
+        that Artifactory read access to shared components is granted fleet-wide
+        by `ps_shared_component_repos`, not per customer — unticking a box here
+        removes the dependency, not the permission.
+      options:
+        - label: scripts-general-util
+          required: false
+
+  - type: dropdown
+    id: runner
+    attributes:
+      label: Default runner
+      description: >-
+        `standard` is the self-hosted pool. Pick it only when the engagement
+        needs network reachability into a customer environment, or while
+        GitHub-hosted minutes are unavailable. A job queued against a label with
+        no online runner sits for 24 hours and is then cancelled, which reads as
+        someone having pressed a button.
+      options:
+        - standard
+        - ubuntu-latest
+      default: 0
+    validations:
+      required: true
+
+  - type: input
+    id: jf_name
+    attributes:
+      label: JFrog platform name
+      description: The `JF_NAME` repository variable. `acrois` resolves to https://acrois.jfrog.io.
+      value: acrois
+    validations:
+      required: true
+
+  - type: input
+    id: lead
+    attributes:
+      label: Engagement lead
+      description: GitHub handle, without the @. Becomes the repository's CODEOWNERS entry.
+      placeholder: acrois
+    validations:
+      required: true
+
+  - type: input
+    id: contact
+    attributes:
+      label: Customer technical contact
+      description: Recorded on this issue only. Nothing reads it.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: ack
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: >-
+            I understand no `JF_PROJECT` variable will be set on this repository,
+            and that setting one later makes the per-repo bundle identity mapping
+            ineligible and silently downgrades every token to a 60-second
+            `Contributor` that cannot overwrite a published bundle.
+          required: true
+        - label: >-
+            I understand JFrog provisioning arrives as a Terraform pull request
+            that a human must review and merge, and that the repository's JFrog
+            steps cannot pass until it applies.
+          required: true
