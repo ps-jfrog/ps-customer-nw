@@ -25,7 +25,7 @@ read. If more than one bundle is visible, pass the name:
 
 ```sh
 jf toolbox bundle list
-jf toolbox bundle use ps-customer-mgm
+jf toolbox bundle use ps-customer-<slug>
 jf toolbox bundle update
 jf toolbox bundle current
 ```
