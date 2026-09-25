@@ -38,6 +38,14 @@ BOT_EMAIL="${BOT_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"
 DRY_RUN="${DRY_RUN:-false}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Copied out now, before the mirror branch's tree gets wiped below: that wipe
+# deletes every file under the working directory, including this script's own
+# siblings on disk, so a later `${SCRIPT_DIR}/push-bot-branch.sh` would be
+# invoking a file that no longer exists.
+PUSH_BOT_BRANCH="$(mktemp)"
+cp "${SCRIPT_DIR}/push-bot-branch.sh" "$PUSH_BOT_BRANCH"
+chmod +x "$PUSH_BOT_BRANCH"
+
 FOLDER_PATH="${BUNDLE_REPO}/${BUNDLE_NAME}/${BUNDLE_VERSION}"
 
 emit() {
@@ -76,6 +84,31 @@ jq -e '.children | length > 0' "$STORAGE_JSON" >/dev/null ||
   die "bundle folder ${FOLDER_PATH} exists but is empty"
 rm -f "$STORAGE_JSON"
 
+MIRROR_COMMIT_MSG="chore: mirror bundle ${BUNDLE_NAME} ${BUNDLE_VERSION}"
+
+# --------------------------------------------------------------------------
+# Skip entirely if this exact version has already been materialized
+# --------------------------------------------------------------------------
+# Re-downloading and overwriting the branch's tree unconditionally would
+# discard any local edits subtree-sync.sh has since pushed back onto it -
+# re-running against the same version would look like it "updated" the
+# mirror, but it would really be reverting the customer's own contribution.
+# Checking history for the exact commit this script makes for that version -
+# not merely "does the tree already match" - is what makes that check survive
+# past unrelated commits landing on top afterwards.
+if git ls-remote --exit-code --heads origin "$MIRROR_BRANCH" >/dev/null 2>&1; then
+  git fetch --quiet origin "$MIRROR_BRANCH:refs/remotes/origin/${MIRROR_BRANCH}" --force ||
+    die "could not fetch ${MIRROR_BRANCH} from origin"
+  # `-F -x`, not `git log --grep`: --fixed-strings there treats ^/$ as
+  # literal characters rather than anchors, so an anchored --grep pattern
+  # can never match - this checks each subject line for an exact match
+  # instead.
+  if git log "origin/${MIRROR_BRANCH}" --format=%s |
+    grep -qFx "$MIRROR_COMMIT_MSG"; then
+    finish up-to-date "${BUNDLE_NAME} ${BUNDLE_VERSION} was already materialized onto ${MIRROR_BRANCH}"
+  fi
+fi
+
 if [ "$DRY_RUN" = "true" ]; then
   finish dry-run-clean "would mirror ${FOLDER_PATH} onto ${MIRROR_BRANCH} (dry run)"
 fi
@@ -85,10 +118,16 @@ fi
 # --------------------------------------------------------------------------
 ORIGINAL_REF="$(git symbolic-ref --short -q HEAD || git rev-parse HEAD)"
 if git ls-remote --exit-code --heads origin "$MIRROR_BRANCH" >/dev/null 2>&1; then
-  git fetch --quiet origin "$MIRROR_BRANCH:refs/remotes/origin/${MIRROR_BRANCH}" --force
-  git checkout --quiet -B "$MIRROR_BRANCH" "origin/${MIRROR_BRANCH}"
+  # Already fetched above.
+  git checkout --quiet -B "$MIRROR_BRANCH" "origin/${MIRROR_BRANCH}" ||
+    die "could not check out ${MIRROR_BRANCH} from origin/${MIRROR_BRANCH}"
 else
-  git checkout --quiet --orphan "$MIRROR_BRANCH"
+  # -B would happily reuse a stale local branch of the same name left behind
+  # by an earlier interrupted run, but --orphan refuses to - deleting it first
+  # means this always starts from a genuinely empty tree.
+  git branch -D "$MIRROR_BRANCH" >/dev/null 2>&1 || true
+  git checkout --quiet --orphan "$MIRROR_BRANCH" ||
+    die "could not create orphan branch ${MIRROR_BRANCH}"
   git rm -rf --quiet . >/dev/null 2>&1 || true
 fi
 
@@ -96,6 +135,13 @@ cleanup() {
   git checkout --quiet "$ORIGINAL_REF" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# Everything from here on destructively rewrites the current checkout. Without
+# set -e, a checkout failure above would otherwise be silently absorbed and
+# this would go on to wipe and recommit whatever branch is actually checked
+# out - which, once, was the caller's own default branch.
+[ "$(git symbolic-ref --short -q HEAD)" = "$MIRROR_BRANCH" ] ||
+  die "not checked out on ${MIRROR_BRANCH} after the branch setup above; refusing to touch the working tree"
 
 # Clear the branch's tree before repopulating it, so a version that dropped
 # files does not leave the old ones behind — this branch has no content of
@@ -130,7 +176,8 @@ git config user.email "$BOT_EMAIL"
 git commit --quiet -m "chore: mirror bundle ${BUNDLE_NAME} ${BUNDLE_VERSION}"
 
 DEFAULT_BRANCH="$DEFAULT_BRANCH" BOT_EMAIL="$BOT_EMAIL" \
-  "${SCRIPT_DIR}/push-bot-branch.sh" "$MIRROR_BRANCH" ||
+  "$PUSH_BOT_BRANCH" "$MIRROR_BRANCH" ||
   die "push-bot-branch.sh refused to push ${MIRROR_BRANCH} — see its output above"
 
+rm -f "$PUSH_BOT_BRANCH"
 finish mirrored "committed and pushed ${BUNDLE_NAME} ${BUNDLE_VERSION} onto ${MIRROR_BRANCH}"
