@@ -1,0 +1,193 @@
+name: Sync PS Bundle
+
+# Materializes one published version of this repository's own Artifactory PS
+# bundle as git history, then transfers/syncs it into this repo's working tree
+# under `prefix` using git subtree — bootstrapping it in on the first run,
+# pulling upstream bundle updates and pushing any local edits under `prefix`
+# back out on every run after that.
+#
+# Runs entirely against this repository, like jfrog-ps-bundle.yaml and
+# share-ps-bundle.yaml: reading the bundle needs this repo's own per-engagement
+# OIDC identity mapping (scoped to its own bundle path, not a broader one the
+# template could use), and writing the result needs only this repo's own
+# GITHUB_TOKEN. Neither step benefits from — or can substitute for — the App
+# credential that onboarding and fan-out sync need to reach *other*
+# repositories.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Bundle version to mirror/sync (e.g. v2026.19.02.5). Must be already published.'
+        required: true
+        type: string
+      bundle:
+        description: 'Bundle name override (defaults to <repo-name> with jfrog-cli-plugin- stripped).'
+        required: false
+        type: string
+        default: ''
+      prefix:
+        description: 'Directory in this repo to hold the synced bundle.'
+        required: false
+        type: string
+        default: 'ps-bundle'
+      dry_run:
+        description: 'Report what would happen without writing anything'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  JF_URL: ${{ secrets.JF_URL || vars.JF_URL || format(secrets.JF_WORKSPACE_BASE_URL || vars.JF_WORKSPACE_BASE_URL || 'https://{0}.jfrog.io/', secrets.JF_NAME || vars.JF_NAME) }}
+  JF_PROJECT: ${{ secrets.JF_PROJECT || vars.JF_PROJECT || '' }}
+  JF_OIDC_AUDIENCE: ${{ secrets.JF_OIDC_AUDIENCE || vars.JF_OIDC_AUDIENCE || format('{0}/{1}', github.server_url, github.repository_owner) }}
+  JF_OIDC_PROVIDER: ${{ secrets.JF_OIDC_PROVIDER || vars.JF_OIDC_PROVIDER || 'ghc-ps-jfrog' }}
+  JFROG_CLI_VERSION: ${{ vars.JFROG_CLI_VERSION || 'latest' }}
+  JFROG_CLI_LOG_TIMESTAMP: DATE_AND_TIME
+  JFROG_CLI_LOG_LEVEL: ${{ vars.JFROG_CLI_LOG_LEVEL || 'INFO' }}
+  JFROG_CLI_ENCRYPTION_KEY: ${{ secrets.JFROG_CLI_ENCRYPTION_KEY || 'ThisIsNotSecureSoSetTheValueNow0' }}
+  JFROG_CLI_REMOTE: ${{ secrets.JFROG_CLI_REMOTE || vars.JFROG_CLI_REMOTE || 'jfrog-cli-remote' }}
+  JFROG_CLI_PLUGINS_SERVER: ${{ secrets.JFROG_CLI_PLUGINS_SERVER || vars.JFROG_CLI_PLUGINS_SERVER || 'setup-jfrog-cli-server' }}
+  BUNDLE_REPO: "${{ secrets.BUNDLE_REPO || vars.BUNDLE_REPO || (secrets.JF_PROJECT || vars.JF_PROJECT || '') && format('{0}-ps-bundles', secrets.JF_PROJECT || vars.JF_PROJECT || '') || '' }}"
+  PR_BRANCH: chore/sync-ps-bundle
+  MIRROR_BRANCH: bundle-mirror
+  BOT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  sync:
+    name: Materialize and sync
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    steps:
+      # No step-level JF_PROJECT override (unlike jfrog-ps-bundle.yaml's build
+      # job): this only ever reads the bundle folder, same reasoning as
+      # share-ps-bundle.yaml's own Setup step.
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        with:
+          version: ${{ env.JFROG_CLI_VERSION }}
+          oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
+          download-repository: ${{ env.JFROG_CLI_REMOTE }}
+          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "${BOT_EMAIL}"
+
+      - name: Resolve bundle name
+        id: resolve
+        env:
+          BUNDLE_NAME_INPUT: ${{ inputs.bundle }}
+          PREFIX_INPUT: ${{ inputs.prefix }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BUNDLE_NAME_INPUT}" ]; then
+            BUNDLE_NAME="${BUNDLE_NAME_INPUT}"
+          else
+            BUNDLE_NAME="${GITHUB_REPOSITORY##*/}"
+            BUNDLE_NAME="${BUNDLE_NAME#jfrog-cli-plugin-}"
+          fi
+          if [ -z "${BUNDLE_REPO}" ]; then
+            echo "::error::BUNDLE_REPO is empty. Set BUNDLE_REPO or JF_PROJECT (repo var/secret)." >&2
+            exit 1
+          fi
+          echo "bundle_name=${BUNDLE_NAME}" >> "$GITHUB_OUTPUT"
+          # git subtree treats a trailing slash as part of the path, so
+          # strip one if given rather than producing e.g. `ps-bundle//file`.
+          echo "prefix=${PREFIX_INPUT%/}" >> "$GITHUB_OUTPUT"
+
+      - name: Materialize bundle version onto ${{ env.MIRROR_BRANCH }}
+        id: materialize
+        env:
+          JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-${{ env.JF_PROJECT }}
+          BUNDLE_NAME: ${{ steps.resolve.outputs.bundle_name }}
+          BUNDLE_VERSION: ${{ inputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: .github/scripts/materialize-bundle.sh
+
+      - name: Sync ${{ steps.resolve.outputs.prefix }} with ${{ env.MIRROR_BRANCH }}
+        id: sync
+        if: inputs.dry_run != true
+        env:
+          PREFIX: ${{ steps.resolve.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          git checkout --quiet -B "${PR_BRANCH}" "origin/${{ github.event.repository.default_branch }}"
+          .github/scripts/subtree-sync.sh --prefix "${PREFIX}" --remote origin --branch "${MIRROR_BRANCH}"
+
+      - name: Guard - tree must be sane before it can be pushed
+        if: inputs.dry_run != true
+        run: .github/scripts/check-tree-sanity.sh
+
+      - name: Push branch and open PR
+        if: inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PREFIX: ${{ steps.resolve.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "origin/${DEFAULT_BRANCH}" -- "${PREFIX}"; then
+            echo "::notice::${PREFIX} already matches ${{ inputs.version }}; nothing to open a PR for."
+            exit 0
+          fi
+
+          .github/scripts/push-bot-branch.sh "${PR_BRANCH}"
+
+          # The heredoc body inherits this step's YAML indentation, which
+          # markdown would otherwise render as a code block — strip it.
+          BODY=$(cat <<EOF | sed -E 's/^[[:space:]]+//'
+          Syncs \`${PREFIX}/\` with the \`${{ steps.resolve.outputs.bundle_name }}\` bundle at
+          \`${{ inputs.version }}\`, via \`.github/scripts/subtree-sync.sh\` against the
+          \`${MIRROR_BRANCH}\` branch this run materialized.
+
+          Local edits under \`${PREFIX}/\` on \`${DEFAULT_BRANCH}\` are folded into this PR
+          too — subtree-sync pushes them back onto \`${MIRROR_BRANCH}\` as part of the
+          same run, so merging this is what keeps both sides reconciled.
+          EOF
+          )
+
+          existing=$(gh pr list --head "${PR_BRANCH}" --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "${existing:-}" ]; then
+            gh pr edit "$existing" --body "$BODY"
+            echo "::notice::Updated existing PR #${existing}"
+          else
+            gh pr create \
+              --title "chore: sync ${PREFIX} with ${{ steps.resolve.outputs.bundle_name }} ${{ inputs.version }}" \
+              --body "$BODY" \
+              --head "${PR_BRANCH}"
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          MATERIALIZE_OUTCOME: ${{ steps.materialize.outputs.outcome }}
+          MATERIALIZE_DETAIL: ${{ steps.materialize.outputs.detail }}
+        run: |
+          {
+            echo "## Sync PS Bundle"
+            echo
+            echo "| step | outcome | detail |"
+            echo "| --- | --- | --- |"
+            echo "| materialize | ${MATERIALIZE_OUTCOME:-(did not run)} | ${MATERIALIZE_DETAIL:-} |"
+          } >> "$GITHUB_STEP_SUMMARY"
