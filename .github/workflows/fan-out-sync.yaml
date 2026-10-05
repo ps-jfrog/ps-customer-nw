@@ -1,0 +1,263 @@
+name: Fan-out Template Sync
+
+# The template is the control plane: it holds the only App credential, and it
+# pushes a sync branch and a PR into each derived repository.
+#
+# The per-repo Sync Template job did the opposite — every repository minted its
+# own token — which meant every repository needed an App client id and private
+# key of its own. Three of thirteen ever got them. With no org-level secrets or
+# variables available, and none creatable, that model cannot be completed; it
+# can only be inverted. Targets now need no credentials at all.
+#
+# This file is copied into every derived repository by the sync it performs, so
+# the guard below is load-bearing. It is a literal comparison, never
+# vars.TEMPLATE_REPO: a repository that could name itself the template could
+# turn itself into a control plane.
+
+on:
+  schedule:
+    - cron: '0 7 * * 1' # Weekly on Mondays at 07:00 UTC
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Comma-separated owner/name list. Empty = discover all.'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Report what would happen without writing anything'
+        required: false
+        default: true
+        type: boolean
+  push:
+    paths:
+      - '.github/workflows/fan-out-sync.yaml'
+      - '.github/scripts/sync-one-repo.sh'
+      - '.github/scripts/push-bot-branch.sh'
+      - '.github/scripts/check-tree-sanity.sh'
+      - '.github/sync-targets.json'
+      - '.github/sync-retired-paths.txt'
+
+permissions:
+  contents: read
+
+# PREFERRED_RUNNER is honoured here for the same reason the rest of the fleet
+# honours it, plus one specific to right now: GitHub-hosted minutes are
+# suspended for this organisation over a billing failure, so every
+# `ubuntu-latest` job is rejected before it starts while the self-hosted
+# `standard` pool keeps running. Pinning to `ubuntu-latest` would make the
+# control plane unrunnable.
+
+# Two overlapping runs would race each other for the same bot branch in every
+# target. cancel-in-progress stays off: a cancelled run can be halfway through
+# a push, and the loser of that race is a target left with a branch and no PR.
+concurrency:
+  group: fan-out-template-sync
+  cancel-in-progress: false
+
+env:
+  TEMPLATE_REPO: ps-jfrog/ps-customer-template
+  PR_BRANCH: chore/sync-template
+
+jobs:
+  discover:
+    name: Discover targets
+    if: github.repository == 'ps-jfrog/ps-customer-template'
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    outputs:
+      targets: ${{ steps.pick.outputs.targets }}
+      count: ${{ steps.pick.outputs.count }}
+      dry_run: ${{ steps.mode.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Decide dry-run mode
+        id: mode
+        run: |
+          set -euo pipefail
+          # A push to this workflow's own files is someone iterating on the
+          # fan-out. It must never be able to write to thirteen repositories as
+          # a side effect of a commit, so it is forced to report-only.
+          case "${{ github.event_name }}" in
+            workflow_dispatch) dry_run='${{ inputs.dry_run }}' ;;
+            schedule)          dry_run=false ;;
+            *)                 dry_run=true ;;
+          esac
+          echo "dry_run=${dry_run}" >> "$GITHUB_OUTPUT"
+          echo "::notice::dry_run=${dry_run} (event ${{ github.event_name }})"
+
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Report App reach
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh api /installation/repositories --paginate \
+            --jq '.repositories[].full_name' | sort > "${RUNNER_TEMP}/reachable.txt"
+          echo "App is installed on:"
+          sed 's/^/  /' "${RUNNER_TEMP}/reachable.txt"
+          {
+            echo "## App installation"
+            echo
+            echo "The fan-out can only write to repositories this App is installed on."
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/reachable.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pick targets
+        id: pick
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          EXPLICIT: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+
+          include=$(jq -r '.include[]?' .github/sync-targets.json | sort -u)
+          exclude=$(jq -r '.exclude[]?' .github/sync-targets.json | sort -u)
+
+          if [ -n "${EXPLICIT// /}" ]; then
+            # An operator naming targets still cannot reach a repository the
+            # App is not installed on, and still cannot name the template.
+            candidates=$(echo "$EXPLICIT" | tr ',' '\n' | sed 's/[[:space:]]//g' | grep . | sort -u)
+            echo "::notice::Explicit target list: $(echo "$candidates" | tr '\n' ' ')"
+          else
+            derived=""
+            while IFS= read -r repo; do
+              [ -n "$repo" ] || continue
+              marker=$(gh api "/repos/${repo}" --jq '.template_repository.full_name // ""' 2>/dev/null || echo "")
+              if [ "$marker" = "${TEMPLATE_REPO}" ]; then
+                derived+="${repo}"$'\n'
+              fi
+            done < "${RUNNER_TEMP}/reachable.txt"
+            candidates=$(printf '%s%s\n' "$derived" "$include" | grep . | sort -u)
+          fi
+
+          targets=$(comm -23 \
+            <(printf '%s\n' "$candidates" | grep . || true) \
+            <(printf '%s\n' "$exclude" | grep . || true) \
+            | grep -v "^${TEMPLATE_REPO}$" || true)
+
+          # Naming an unreachable repository is an error worth surfacing now
+          # rather than as thirteen identical clone failures later.
+          unreachable=$(comm -23 <(printf '%s\n' "$targets" | grep . || true) "${RUNNER_TEMP}/reachable.txt" || true)
+          if [ -n "$unreachable" ]; then
+            echo "::warning::App is not installed on: $(echo "$unreachable" | tr '\n' ' ')"
+          fi
+
+          count=$(printf '%s\n' "$targets" | grep -c . || true)
+          json=$(printf '%s\n' "$targets" | grep . | jq -R . | jq -sc .)
+          echo "targets=${json}" >> "$GITHUB_OUTPUT"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Targets (${count})"
+            echo
+            printf '%s\n' "$targets" | grep . | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sync:
+    name: ${{ matrix.target }}
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      # One target's failure says nothing about the others. The fan-out is only
+      # useful if it keeps going and reports per repository.
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        target: ${{ fromJSON(needs.discover.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Sync
+        id: sync
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TEMPLATE_DIR: ${{ github.workspace }}
+          WORK_DIR: ${{ runner.temp }}/targets
+          DRY_RUN: ${{ needs.discover.outputs.dry_run }}
+        run: |
+          mkdir -p "$WORK_DIR"
+          .github/scripts/sync-one-repo.sh "${{ matrix.target }}"
+
+      - name: Record outcome
+        if: always()
+        run: |
+          # RUNNER_TEMP, not /tmp: self-hosted runners keep /tmp between jobs, so
+          # a shared path collects every other matrix leg's result and the
+          # summary reports each repository several times.
+          mkdir -p "${RUNNER_TEMP}/outcomes"
+          slug=$(echo "${{ matrix.target }}" | tr '/' '_')
+          printf '%s\t%s\t%s\n' \
+            "${{ matrix.target }}" \
+            "${{ steps.sync.outputs.outcome || 'error' }}" \
+            "${{ steps.sync.outputs.detail || 'the sync step did not complete' }}" \
+            > "${RUNNER_TEMP}/outcomes/${slug}.tsv"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: outcome-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/outcomes/
+          retention-days: 7
+
+  report:
+    name: Report
+    needs: [discover, sync]
+    if: always() && github.repository == 'ps-jfrog/ps-customer-template'
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: outcome-*
+          path: ${{ runner.temp }}/outcomes
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Summarise
+        run: |
+          set -euo pipefail
+          mode=$([ "${{ needs.discover.outputs.dry_run }}" = "true" ] && echo "dry run" || echo "live")
+
+          {
+            echo "## Fan-out sync (${mode})"
+            echo
+            echo "| repository | outcome | detail |"
+            echo "| --- | --- | --- |"
+            cat "${RUNNER_TEMP}"/outcomes/*.tsv 2>/dev/null |
+              sort |
+              awk -F'\t' '{printf "| `%s` | %s | %s |\n", $1, $2, $3}'
+            echo
+            echo "\`aborted-conflict\` is a correct result, not a defect: a repository"
+            echo "that has never landed a sync merge shares no history with the"
+            echo "template, so its drifted files merge as add/add conflicts. It stays"
+            echo "that way until one merge is reconciled and committed by hand — see"
+            echo "\`docs/customer-repo-migration-runbook.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Only a genuine error fails the run. Aborts are expected output.
+          if cat "${RUNNER_TEMP}"/outcomes/*.tsv 2>/dev/null | awk -F'\t' '$2 == "error"' | grep -q .; then
+            echo "::error::At least one target errored."
+            exit 1
+          fi

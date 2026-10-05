@@ -1,0 +1,22 @@
+{
+  "$comment": [
+    "Fan-out Template Sync discovers its targets from GitHub's template_repository",
+    "marker, so a repository generated from this template is picked up with no",
+    "edit here. This file covers the two cases the marker cannot express.",
+    "",
+    "include: repositories that genuinely derive from the template but carry no",
+    "marker, because they predate its use as a template. Being named",
+    "ps-customer-* is not the test — derivation is. ps-customer-by and",
+    "ps-customer-pwc both predate the template and share none of its shape (no",
+    ".envrc, no workflows, no bundle manifest); syncing into them would dump a",
+    "template on top of unrelated work.",
+    "",
+    "exclude: derived repositories to leave alone, for example an engagement that",
+    "has ended or one being migrated by hand."
+  ],
+  "include": [
+    "ps-jfrog/ps-customer-medtronic",
+    "ps-jfrog/ps-customer-bofa"
+  ],
+  "exclude": []
+}

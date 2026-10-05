@@ -1,0 +1,18 @@
+# Paths the template has deleted, and that the fan-out sync must therefore
+# delete from every derived repository.
+#
+# Deleting a file here is not enough on its own. Template-derived repositories
+# have unrelated histories, so a merge has no base to tell "they deleted it"
+# apart from "we added it" — the target keeps the file indefinitely. Listing it
+# here is what actually retires it.
+#
+# This is an allowlist on purpose. The alternative rule, "delete anything the
+# template does not have", would strip every legitimately customer-specific
+# file in the fleet.
+
+# Superseded by the template-side Fan-out Template Sync. The per-repo job needs
+# an App client id and private key to mint its own token; eight of the derived
+# repositories have neither, so it has never been able to run there and shows
+# as a permanently failing check. The control plane now pushes sync branches
+# in, so the credential — and the workflow that needed it — are both obsolete.
+.github/workflows/sync-template.yaml
