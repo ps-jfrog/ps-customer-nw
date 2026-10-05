@@ -46,7 +46,8 @@ BUNDLE_REPO="${BUNDLE_REPO:-ps-jfrog-ps-bundles}"
 # the org default is Solution, which is why it has to be passed explicitly.
 PS_DATA_CLASS="${PS_DATA_CLASS:-Customer}"
 
-# Branch the seeded history lands on. The template's default branch.
+# Generated repositories land on the template's default branch. Nothing in
+# this script pushes history onto that branch.
 SEED_BRANCH="${SEED_BRANCH:-main}"
 
 : "${GH_TOKEN:?GH_TOKEN is required}"
@@ -250,89 +251,144 @@ else
 fi
 
 # --- create repository ---------------------------------------------------
-# Deliberately NOT `POST /repos/{template}/generate`, for two independent
-# reasons. Either one alone would be enough; do not "simplify" this back.
+# Create with `POST /repos/{template}/generate`, not `POST /orgs/{org}/repos`.
+# An empty repository plus a push of template history has no
+# `template_repository` marker, and that marker is what "based off the
+# template" means. Do not "simplify" this back to an empty repo. Do not push
+# template history over a generated repository either: that orphans the
+# snapshot GitHub recorded as the Initial commit.
 #
-# 1. It cannot work in this organisation at all. `ps_data_class` is a required
-#    org custom property with `require_explicit_values: true`, so every
-#    /generate call fails with "Repository Property 'ps_data_class' requires an
-#    explicit value to be set", and /generate has no parameter to supply one.
-#    Granting the App organisation administration would not change this.
-# 2. Even where it works, it produces a squashed `Initial commit` with **no
-#    shared history** with the template. With no merge base, every later sync is
-#    an unrelated-histories merge in which each file the template *modifies*
-#    (rather than merely adds) is an add/add conflict, and the fan-out aborts.
-#    `ps-customer-valero` was generated this way and syncs clean today only
-#    because template changes since have happened to be additive; the first
-#    modification to a shared file turns it into an aborting repository.
-#
-# `POST /orgs/{org}/repos` accepts `custom_properties`, and seeding by pushing
-# the template's real history gives the new repository a merge base on day one.
-# `ps-customer-bofa` was created that way and reports `up-to-date` against the
-# template rather than merely "clean".
+# Re-tested live on 2026-10-05 against ps-jfrog/ps-customer-template:
+#   * `custom_properties` in the /generate JSON body is rejected with 422
+#     "not a permitted key". GraphQL cloneTemplateRepository has no properties
+#     field either. There is no supported generate field for the property.
+#   * /generate into this org, while `ps_data_class` has
+#     `require_explicit_values: true`, returns 422 "Could not clone:
+#     Repository Property 'ps_data_class' requires an explicit value to be
+#     set". The repository is not created, so a following PATCH cannot run.
+#   * The sequence that both sets `template_repository` and satisfies the
+#     property: briefly clear `require_explicit_values`, /generate into the
+#     org (`private` from the form), PATCH
+#     `/repos/{owner}/{repo}/properties/values` to `ps_data_class=Customer`,
+#     then restore the flag to whatever it was. The App holds
+#     `organization_custom_properties: write` for that schema update and
+#     `repository_custom_properties: write` for the value.
+# The flag is an org-wide switch. Restore it even when generate fails, and
+# fail the run if the restore itself fails.
+CREATED_THIS_RUN=false
 if [ "$REPO_EXISTS" = "true" ]; then
   step done "create repository" "[\`${TARGET}\`](https://github.com/${TARGET}) already exists — not touched"
 elif [ "$DRY_RUN" = "true" ]; then
-  step skipped "create repository" "would create \`${TARGET}\` via \`POST /orgs/${ORG}/repos\` with \`ps_data_class=${PS_DATA_CLASS}\`, then seed it with the template's history (dry run)"
+  step skipped "create repository" "would \`POST /repos/${TEMPLATE_REPO}/generate\` (private=${VISIBILITY}) then set \`ps_data_class=${PS_DATA_CLASS}\` (dry run)"
+elif [ "$APP_OK" != "true" ]; then
+  step blocked "create repository" "no usable App token"
+  blocker "The App token could not be minted. Check \`vars.APP_CLIENT_ID\` and \`secrets.APP_PRIVATE_KEY\` on \`${TEMPLATE_REPO}\`."
 else
-  # Creating a repository in the org is an organisation-level write.
-  # Repository-scoped permissions never satisfy it, no matter how many are
-  # granted.
-  if [ "$APP_OK" != "true" ]; then
-    step blocked "create repository" "no usable App token"
-    blocker "The App token could not be minted. Check \`vars.APP_CLIENT_ID\` and \`secrets.APP_PRIVATE_KEY\` on \`${TEMPLATE_REPO}\`."
-  elif out="$(GH_TOKEN="$APP_TOKEN" gh api --method POST "/orgs/${ORG}/repos" \
-    --input - <<<"$(jq -n \
-      --arg name "$REPO_NAME" \
-      --arg description "JFrog PS engagement — ${CUSTOMER_NAME}" \
-      --argjson private "$([ "$VISIBILITY" = private ] && echo true || echo false)" \
-      --arg data_class "$PS_DATA_CLASS" \
-      '{
-         name: $name,
-         description: $description,
-         private: $private,
-         # An empty repository is the point: the seed step below pushes the
-         # template history onto it, and auto_init would put an unrelated
-         # root commit in the way of exactly the merge base we are buying.
-         auto_init: false,
-         custom_properties: { ps_data_class: [$data_class] }
-       }')" 2>&1)"; then
-    step done "create repository" "created [\`${TARGET}\`](https://github.com/${TARGET}) with \`ps_data_class=${PS_DATA_CLASS}\`"
-    REPO_EXISTS=true
+  schema_url="/orgs/${ORG}/properties/schema"
+  saved_schema="$(GH_TOKEN="$APP_TOKEN" gh api "${schema_url}/ps_data_class" 2>/tmp/onboard-schema-err || true)"
+  if [ -z "$saved_schema" ] || ! jq -e '.property_name' <<<"$saved_schema" >/dev/null; then
+    step blocked "create repository" "cannot read the \`ps_data_class\` schema"
+    blocker "Reading the org custom property failed: $(tr '\n' ' ' </tmp/onboard-schema-err). The App needs **Organization permissions -> Custom properties: read**."
   else
-    step blocked "create repository" "\`POST /orgs/${ORG}/repos\` was refused"
-    blocker "Creating a repository needs **Organization permissions -> Administration: write** on the App, granted at <https://github.com/organizations/${ORG}/settings/apps/jfrog-ps-customer-template/permissions>, then accepted for the installation. Repository-scoped permissions cannot substitute for it."
-    echo "::warning::${out}"
+    original_explicit="$(jq -r '.require_explicit_values' <<<"$saved_schema")"
+    schema_body() {
+      jq -n --argjson s "$saved_schema" --argjson explicit "$1" '{
+        properties: [{
+          property_name: $s.property_name,
+          value_type: $s.value_type,
+          required: $s.required,
+          default_value: $s.default_value,
+          description: $s.description,
+          allowed_values: $s.allowed_values,
+          values_editable_by: $s.values_editable_by,
+          require_explicit_values: $explicit
+        }]
+      }'
+    }
+    restore_explicit() {
+      local err
+      err="$(GH_TOKEN="$APP_TOKEN" gh api --method PATCH "$schema_url" \
+        --input - <<<"$(schema_body "$original_explicit")" 2>&1 >/dev/null)" || {
+        echo "::error::failed to restore ps_data_class require_explicit_values=${original_explicit}: ${err}"
+        return 1
+      }
+      local now
+      now="$(GH_TOKEN="$APP_TOKEN" gh api "${schema_url}/ps_data_class" --jq '.require_explicit_values' 2>/dev/null || echo missing)"
+      [ "$now" = "$original_explicit" ]
+    }
+    # If the step is killed after the flag is cleared, put it back.
+    trap 'if [ "${relaxed:-false}" = "true" ]; then restore_explicit || echo "::error::could not restore ps_data_class on exit"; fi' EXIT
+
+    relaxed=false
+    if [ "$original_explicit" = "true" ]; then
+      if relax_err="$(GH_TOKEN="$APP_TOKEN" gh api --method PATCH "$schema_url" \
+        --input - <<<"$(schema_body false)" 2>&1 >/dev/null)"; then
+        relaxed=true
+      else
+        step blocked "create repository" "cannot clear \`require_explicit_values\` on \`ps_data_class\`"
+        blocker "\`PATCH ${schema_url}\` was refused (${relax_err}). /generate has no custom-properties field, and with the flag set it 422s before a repository exists. The App needs **Organization permissions -> Custom properties: write**. Do not fall back to \`POST /orgs/${ORG}/repos\`."
+      fi
+    fi
+
+    if [ "$original_explicit" != "true" ] || [ "$relaxed" = "true" ]; then
+      private=false
+      [ "$VISIBILITY" = "private" ] && private=true
+      gen_err=""
+      if gen_err="$(GH_TOKEN="$APP_TOKEN" gh api --method POST "/repos/${TEMPLATE_REPO}/generate" \
+        --input - <<<"$(jq -n \
+          --arg owner "$ORG" \
+          --arg name "$REPO_NAME" \
+          --arg description "JFrog PS engagement — ${CUSTOMER_NAME}" \
+          --argjson private "$private" \
+          '{owner:$owner, name:$name, description:$description, private:$private, include_all_branches:false}')" 2>&1 >/dev/null)"; then
+        REPO_EXISTS=true
+        CREATED_THIS_RUN=true
+        prop_err=""
+        if prop_err="$(GH_TOKEN="$APP_TOKEN" gh api --method PATCH "/repos/${TARGET}/properties/values" \
+          --input - <<<"$(jq -n --arg cls "$PS_DATA_CLASS" \
+            '{properties:[{property_name:"ps_data_class", value:[$cls]}]}')" 2>&1 >/dev/null)"; then
+          step done "create repository" "generated [\`${TARGET}\`](https://github.com/${TARGET}) from \`${TEMPLATE_REPO}\` and set \`ps_data_class=${PS_DATA_CLASS}\`"
+        else
+          step failed "create repository" "generated \`${TARGET}\` but setting \`ps_data_class\` failed"
+          blocker "\`PATCH /repos/${TARGET}/properties/values\` failed: ${prop_err}"
+          echo "::warning::${prop_err}"
+        fi
+      else
+        step blocked "create repository" "\`POST /repos/${TEMPLATE_REPO}/generate\` was refused"
+        blocker "Generate failed (${gen_err}). Empty-repo creation is not the fallback."
+        echo "::warning::${gen_err}"
+      fi
+    fi
+
+    if [ "$relaxed" = "true" ]; then
+      if restore_explicit; then
+        relaxed=false
+        step done "restore ps_data_class rule" "\`require_explicit_values\` is \`${original_explicit}\` again"
+      else
+        step failed "restore ps_data_class rule" "\`require_explicit_values\` was cleared and could not be restored to \`${original_explicit}\`"
+        blocker "Restore \`ps_data_class.require_explicit_values\` to \`${original_explicit}\` by hand. Until then new repositories in \`${ORG}\` are not forced to choose a value."
+      fi
+    fi
   fi
 fi
 
-# --- seed with the template's history -------------------------------------
-# Check-then-act on commit count, so a re-run after a partial onboarding
-# resumes instead of trying to push over engagement work. An empty repository
-# answers 409 on /commits, which is the case we want to act on.
+# --- template marker ------------------------------------------------------
+# Confirm the marker and stop. Pushing this checkout's history onto the
+# generated branch would orphan the Initial commit. An existing repository is
+# left alone even when it has no marker (idempotent re-run).
 if [ "$REPO_EXISTS" != "true" ]; then
-  step skipped "seed history" "no repository yet"
+  step skipped "template marker" "no repository yet"
+elif [ "$DRY_RUN" = "true" ]; then
+  step skipped "template marker" "would require \`template_repository=${TEMPLATE_REPO}\` and would not push history (dry run)"
 else
-  seed_commits="$(GH_TOKEN="${APP_TOKEN:-$GH_TOKEN}" \
-    gh api "/repos/${TARGET}/commits?per_page=1" --jq 'length' 2>/dev/null || echo 0)"
-  if [ "${seed_commits:-0}" != "0" ]; then
-    step done "seed history" "\`${TARGET}\` already has commits — not touched"
-  elif [ "$DRY_RUN" = "true" ]; then
-    step skipped "seed history" "would push the template's history to \`${TARGET}\` (dry run)"
-  elif [ "$(git rev-list --count HEAD 2>/dev/null || echo 1)" -le 1 ]; then
-    # A shallow checkout would push a single grafted commit — that is
-    # /generate's failure mode wearing a different hat. The workflow asks for
-    # fetch-depth: 0 precisely so this never silently degrades.
-    step failed "seed history" "this checkout has no history to push; the workflow needs \`fetch-depth: 0\`"
-  elif seed_out="$(git push --quiet \
-    "https://x-access-token:${APP_TOKEN}@github.com/${TARGET}.git" \
-    "HEAD:refs/heads/${SEED_BRANCH}" 2>&1)"; then
-    step done "seed history" \
-      "pushed $(git rev-list --count HEAD) commits of template history to \`${SEED_BRANCH}\`, so \`${TARGET}\` has a merge base with the template from day one"
+  marker="$(GH_TOKEN="${APP_TOKEN:-$GH_TOKEN}" gh api "/repos/${TARGET}" \
+    --jq '.template_repository.full_name // empty' 2>/dev/null || true)"
+  if [ "$CREATED_THIS_RUN" = "true" ] && [ "$marker" != "$TEMPLATE_REPO" ]; then
+    step failed "template marker" "\`${TARGET}\` reports \`${marker:-no template_repository}\`, expected \`${TEMPLATE_REPO}\`. History was not pushed."
+  elif [ "$marker" = "$TEMPLATE_REPO" ]; then
+    step done "template marker" "\`${marker}\` on \`${SEED_BRANCH}\`. History was not pushed over the generated snapshot."
   else
-    step blocked "seed history" "cannot push to \`${TARGET}\`"
-    blocker "Seeding needs **Repository permissions -> Contents: write** on the App for \`${TARGET}\`. A repository the App created is normally added to the installation automatically; if it was created by hand, add it at <https://github.com/organizations/${ORG}/settings/installations>."
-    echo "::warning::${seed_out}"
+    step done "template marker" "existing repository left as-is (\`template_repository=${marker:-none}\`)"
   fi
 fi
 
@@ -519,11 +575,11 @@ fi
 BODY_OUT+="
 ### What remains, always
 
-0. **Add \`${TARGET}\` to \`.github/sync-targets.json\` in \`${TEMPLATE_REPO}\`.**
-   Seeding with the template's history is what buys the merge base, but it also
-   means the repository carries no \`template_repository\` marker — and that
-   marker is how the fan-out discovers targets. Until it is listed under
-   \`include\`, this repository is never synced.
+0. **Fan-out discovers this repository from \`template_repository\`.**
+   A repository generated from \`${TEMPLATE_REPO}\` does not need an
+   \`include\` entry in \`.github/sync-targets.json\`. That file is only for
+   repositories created before the marker existed. The App must be installed
+   on \`${TARGET}\` or the fan-out cannot write to it.
 1. **Review and merge the Terraform PR.** ${TF_PR_URL:-(not opened — see above)}
 2. **Wait for it to apply.** The group, bundle permission, build-info
    permission and OIDC identity mapping do not exist until then, and nothing
