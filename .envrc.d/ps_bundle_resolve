@@ -1,0 +1,420 @@
+#!/bin/bash
+
+alias ps-bundle-resolve=ps_bundle_resolve
+
+ps_bundle_resolve() {
+    # Check for help request (POSIX compatible)
+    if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+        cat << 'help'
+NAME
+    ps_bundle_resolve - Materialise declared PS bundle dependencies from Artifactory
+
+SYNOPSIS
+    ps_bundle_resolve [OPTIONS]
+
+DESCRIPTION
+    Reads ps-bundle.deps.json from the repository root and downloads each
+    declared dependency from:
+
+        ${BUNDLE_REPO}/<name>/<version>/
+
+    into its <target> directory, so the content is on disk before the
+    bundle zip is built.
+
+    Every entry of the manifest's "deps" array understands:
+
+        name      Folder under the bundle repository (required)
+        version   Exact version tag, or the literal string "latest"
+        target    Destination directory (default: deps/<name>)
+
+    When version is "latest" the newest published version is resolved at
+    run time with jf rt s.
+
+    Resolution is idempotent. A successful download writes the resolved
+    version to <target>/.ps-bundle-version; a later run whose requested
+    version matches that sentinel skips the download. A "latest" dep is
+    re-resolved on every run, but still skips the download when the
+    resolved version matches the sentinel.
+
+    Downloaded files get the executable bit restored, because the exploded
+    upload (jf rt u --explode) drops the Unix mode server-side.
+
+    If ps-bundle.deps.json is absent the command is a silent no-op. If jq,
+    jf, or a usable JFrog server configuration is missing, a warning goes
+    to stderr and the command still succeeds, so a developer without JFrog
+    access can enter the directory. Download failures are fatal.
+
+OPTIONS
+    --help, -h        Show this help message
+    --man, -m         Display manpage (if available)
+    --print-plan      Print the resolved name/version/target triples, tab
+                      separated, and exit without downloading. No server
+                      is contacted, so "latest" is printed unresolved.
+
+ENVIRONMENT
+    BUNDLE_REPO       Source Artifactory repository
+    JF_PROJECT        Project key used to infer BUNDLE_REPO when BUNDLE_REPO is unset
+    JFROG_CLI_SERVER_ID       Server id passed to jf
+    JFROG_CLI_PLUGINS_SERVER  Server id prefix combined with JF_PROJECT
+    PS_BUNDLE_DEPS    Manifest path (default: <repo root>/ps-bundle.deps.json)
+
+EXAMPLES
+    # Resolve every declared dependency
+    ps_bundle_resolve
+
+    # Show what would be resolved, without contacting Artifactory
+    ps_bundle_resolve --print-plan
+
+    # Resolve against an explicit repository
+    BUNDLE_REPO=ps-jfrog-ps-bundles ps_bundle_resolve
+
+EXIT STATUS
+    0  Success, or nothing to do
+    1  Error occurred
+    2  Invalid arguments
+
+SEE ALSO
+    ps_bundle_upload(1), jf(1), jq(1), git(1)
+help
+        return 0
+    fi
+
+    # Check for manpage request
+    if [ "${1:-}" = "--man" ] || [ "${1:-}" = "-m" ]; then
+        if command -v man >/dev/null 2>&1; then
+            extract_heredoc --strip "${BASH_SOURCE[0]:-$0}" MANPAGE | man -l -
+        else
+            echo "Error: man command not available" >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    _ps_bundle_repo_root() {
+        git rev-parse --show-toplevel 2>/dev/null || pwd
+    }
+
+    _ps_bundle_manifest() {
+        if [ -n "${PS_BUNDLE_DEPS:-}" ]; then
+            [ -f "$PS_BUNDLE_DEPS" ] || return 1
+            printf '%s\n' "$PS_BUNDLE_DEPS"
+            return 0
+        fi
+
+        local candidate
+        for candidate in "$(_ps_bundle_repo_root)/ps-bundle.deps.json" "./ps-bundle.deps.json"; do
+            if [ -f "$candidate" ]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+
+        return 1
+    }
+
+    _ps_bundle_detect_repo() {
+        command -v jq >/dev/null 2>&1 || return 1
+        command -v jf >/dev/null 2>&1 || return 1
+
+        local repos
+        repos="$(jf rt curl -sS -XGET api/repositories 2>/dev/null | jq -r '
+            [.[] | select(.type == "LOCAL" and .packageType == "Generic" and (.key | endswith("-ps-bundles"))) | .key]
+            | if length == 1 then .[0] else empty end
+        ')" || return 1
+
+        [ -n "$repos" ] || return 1
+        printf '%s\n' "$repos"
+    }
+
+    _ps_bundle_repo() {
+        if [ -n "${BUNDLE_REPO:-}" ]; then
+            printf '%s\n' "$BUNDLE_REPO"
+            return 0
+        fi
+
+        if [ -n "${JF_PROJECT:-}" ]; then
+            printf '%s-ps-bundles\n' "$JF_PROJECT"
+            return 0
+        fi
+
+        _ps_bundle_detect_repo
+    }
+
+    _ps_bundle_server_id() {
+        if [ -n "${JFROG_CLI_SERVER_ID:-}" ]; then
+            printf '%s\n' "$JFROG_CLI_SERVER_ID"
+            return 0
+        fi
+
+        if [ -n "${JFROG_CLI_PLUGINS_SERVER:-}" ] && [ -n "${JF_PROJECT:-}" ]; then
+            printf '%s-%s\n' "$JFROG_CLI_PLUGINS_SERVER" "$JF_PROJECT"
+            return 0
+        fi
+
+        return 1
+    }
+
+    _ps_bundle_have_jfrog() {
+        command -v jf >/dev/null 2>&1 || return 1
+
+        if _ps_bundle_server_id >/dev/null 2>&1; then
+            return 0
+        fi
+
+        jf c show >/dev/null 2>&1
+    }
+
+    _ps_bundle_target_ok() {
+        case "$1" in
+            /*|*..*|"") return 1 ;;
+        esac
+        return 0
+    }
+
+    _ps_bundle_sentinel_version() {
+        local sentinel="${1%/}/.ps-bundle-version"
+        [ -f "$sentinel" ] || return 1
+        tr -d '[:space:]' < "$sentinel"
+    }
+
+    _ps_bundle_latest_version() {
+        local repo="$1" name="$2" server_id="${3:-}" path
+        local search_args=(rt s "${repo%/}/${name}/*" --sort-by=created --sort-order=desc --limit=1)
+
+        if [ -n "$server_id" ]; then
+            search_args+=(--server-id="$server_id")
+        fi
+
+        path="$(jf "${search_args[@]}" 2>/dev/null | jq -r 'first(.[]?.path) // empty')" || return 1
+        [ -n "$path" ] || return 1
+
+        path="${path#"${repo%/}"/}"
+        path="${path#"$name"/}"
+        path="${path%%/*}"
+
+        [ -n "$path" ] || return 1
+        printf '%s\n' "$path"
+    }
+
+    local manifest bundle_repo server_id print_plan=0 status=0
+    local name version target resolved cached download_log
+    local server_args=()
+
+    case "${1:-}" in
+        --print-plan)
+            print_plan=1
+            ;;
+        "")
+            ;;
+        *)
+            echo "Error: unknown option: $1" >&2
+            return 2
+            ;;
+    esac
+
+    if ! command -v jq >/dev/null 2>&1; then
+        if [ "$print_plan" -eq 0 ]; then
+            echo "Warning: jq is required to resolve bundle dependencies; skipping." >&2
+        fi
+        return 0
+    fi
+
+    manifest="$(_ps_bundle_manifest)" || return 0
+
+    if [ "$print_plan" -eq 0 ]; then
+        if ! _ps_bundle_have_jfrog; then
+            echo "Warning: no usable JFrog CLI configuration; skipping bundle dependency resolution." >&2
+            return 0
+        fi
+
+        bundle_repo="$(_ps_bundle_repo)" || {
+            echo "Warning: BUNDLE_REPO is unset and no bundle repository could be inferred; skipping bundle dependency resolution." >&2
+            return 0
+        }
+
+        server_id="$(_ps_bundle_server_id)" || server_id=""
+        if [ -n "$server_id" ]; then
+            server_args+=(--server-id="$server_id")
+        fi
+    fi
+
+    while IFS=$'\t' read -r name version target; do
+        [ -n "$name" ] || continue
+        [ -n "$version" ] || version="latest"
+        [ -n "$target" ] || target="deps/${name}"
+
+        if ! _ps_bundle_target_ok "$target"; then
+            echo "Error: refusing to resolve ${name} into unsafe target: ${target}" >&2
+            status=1
+            continue
+        fi
+
+        resolved="$version"
+
+        if [ "$print_plan" -eq 1 ]; then
+            printf '%s\t%s\t%s\n' "$name" "$resolved" "${target%/}"
+            continue
+        fi
+
+        if [ "$version" = "latest" ]; then
+            resolved="$(_ps_bundle_latest_version "$bundle_repo" "$name" "$server_id")" || {
+                echo "Error: unable to resolve the latest version of ${name} in ${bundle_repo}." >&2
+                status=1
+                continue
+            }
+        fi
+
+        cached="$(_ps_bundle_sentinel_version "$target")" || cached=""
+        if [ "$cached" = "$resolved" ]; then
+            printf '%s %s -> %s/ (cached)\n' "$name" "$resolved" "${target%/}"
+            continue
+        fi
+
+        # bash 3.2 (stock macOS) treats "${server_args[@]}" as unbound under
+        # set -u when the array is empty, so expand it through the +alternate
+        # form instead.
+        # Published bundles nest their payload under a bin/ prefix: the upload
+        # is `jf rt u bin/output.zip <target>/ --flat=false --explode`, and
+        # --flat=false preserves the artifact's bin/ path component. Matching
+        # on `<version>/bin/(*)` and emitting `{1}` therefore strips that level
+        # so a dep's files land at <target>/<file>, not <target>/bin/<file>.
+        # This is the same pattern the customer-facing download in README.md
+        # uses, and the parent's .envrc.d symlinks depend on the flat result.
+        if ! download_log="$(jf rt dl \
+            "${bundle_repo%/}/${name}/${resolved}/bin/(*)" \
+            "${target%/}/{1}" \
+            --flat=false \
+            --fail-no-op=true \
+            ${server_args[@]+"${server_args[@]}"} 2>&1)"; then
+            printf '%s\n' "$download_log" >&2
+            echo "Error: failed to download ${name} ${resolved} from ${bundle_repo}." >&2
+            status=1
+            continue
+        fi
+
+        # The exploded upload strips the Unix mode server-side, so bundle
+        # content arrives 0644; the PATH-executable helpers symlinked out of
+        # a dep need the bit back. `.envrc -live` does the same for .envrc.d.
+        if ! find "${target%/}" -type f -exec chmod +x {} +; then
+            echo "Warning: unable to restore the executable bit under ${target%/}" >&2
+        fi
+
+        printf '%s\n' "$resolved" > "${target%/}/.ps-bundle-version" || {
+            echo "Error: unable to write ${target%/}/.ps-bundle-version" >&2
+            status=1
+            continue
+        }
+
+        printf '%s %s -> %s/ (downloaded)\n' "$name" "$resolved" "${target%/}"
+    done < <(jq -r '.deps[]? | [(.name // ""), (.version // "latest"), (.target // "")] | @tsv' "$manifest")
+
+    return "$status"
+}
+
+# Manpage content (optional, for help2man integration)
+:<<'MANPAGE'
+.TH PS_BUNDLE_RESOLVE 1 "2026-09-03" "Version 1.0" "User Commands"
+.SH NAME
+ps_bundle_resolve \- Materialise declared PS bundle dependencies from Artifactory
+
+.SH SYNOPSIS
+.B ps_bundle_resolve
+[\fBOPTIONS\fR]
+
+.SH DESCRIPTION
+Reads ps-bundle.deps.json from the repository root and downloads each declared
+dependency from ${BUNDLE_REPO}/<name>/<version>/ into its <target> directory, so
+the content is on disk before the bundle zip is built.
+
+Each dep declares a name (folder under the bundle repository), a version (an
+exact tag or the literal string "latest"), and an optional target directory that
+defaults to deps/<name>. A "latest" version is resolved at run time with
+jf rt s.
+
+Resolution is idempotent. A successful download writes the resolved version to
+<target>/.ps-bundle-version, and a later run whose requested version matches that
+sentinel skips the download.
+
+If ps-bundle.deps.json is absent the command is a silent no-op. If jq, jf, or a
+usable JFrog server configuration is missing, a warning goes to stderr and the
+command still succeeds. Download failures are fatal.
+
+.SH OPTIONS
+.TP
+.BR \-\-help ", " \-h
+Show help message
+.TP
+.BR \-\-man ", " \-m
+Display manpage
+.TP
+.BR \-\-print-plan
+Print the resolved name/version/target triples, tab separated, and exit without
+downloading
+
+.SH ENVIRONMENT
+.TP
+.B BUNDLE_REPO
+Source Artifactory repository
+.TP
+.B JF_PROJECT
+Project key used to infer BUNDLE_REPO when BUNDLE_REPO is unset
+.TP
+.B JFROG_CLI_SERVER_ID
+Server id passed to jf
+.TP
+.B JFROG_CLI_PLUGINS_SERVER
+Server id prefix combined with JF_PROJECT
+.TP
+.B PS_BUNDLE_DEPS
+Manifest path (default: <repo root>/ps-bundle.deps.json)
+
+.SH EXAMPLES
+.TP
+ps_bundle_resolve
+Resolve every declared dependency
+.TP
+ps_bundle_resolve \-\-print-plan
+Show what would be resolved, without contacting Artifactory
+.TP
+BUNDLE_REPO=ps-jfrog-ps-bundles ps_bundle_resolve
+Resolve against an explicit repository
+
+.SH EXIT STATUS
+.TP
+.B 0
+Success, or nothing to do
+.TP
+.B 1
+Error occurred
+.TP
+.B 2
+Invalid arguments
+
+.SH SEE ALSO
+.BR ps_bundle_upload (1),
+.BR jf (1),
+.BR jq (1),
+.BR git (1)
+MANPAGE
+
+# This helper materialises the very tree that provides the shared _is_sourced,
+# so it has to keep working when that helper is not on disk yet.
+case "$(command -v _is_sourced 2>/dev/null)" in
+    "")
+        _is_sourced() {
+            if [ -n "${FORCE_SOURCED:-}" ]; then
+                return 0
+            fi
+            [ "${BASH_SOURCE[0]:-$0}" != "${0}" ]
+        }
+        ;;
+    /*)
+        # shellcheck source=/dev/null
+        . _is_sourced
+        ;;
+esac
+
+if ! _is_sourced; then
+    set -euo pipefail
+    ps_bundle_resolve "$@"
+fi

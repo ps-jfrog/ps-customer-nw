@@ -1,3 +1,7 @@
 .DS_Store
 bin/*
 !bin/.gitignore
+
+# Resolver-managed dependency targets from ps-bundle.deps.json.
+/scripts-general-util/
+/deps/

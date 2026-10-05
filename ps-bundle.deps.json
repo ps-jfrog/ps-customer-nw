@@ -1,0 +1,10 @@
+{
+  "$schema": "https://ps-jfrog.example/ps-bundle-deps.schema.json",
+  "deps": [
+    {
+      "name": "scripts-general-util",
+      "version": "v2026.36.05.3",
+      "target": "scripts-general-util"
+    }
+  ]
+}
