@@ -1,0 +1,39 @@
+---
+description: Land work on main; branches isolate, they do not park
+alwaysApply: true
+---
+
+# Integrate, do not strand
+
+These repos have no external consumers. Branches, PRs, and submodules
+exist to keep customers isolated and work organized — not as review
+gates or as somewhere to leave things. Work that sits on a branch is
+not done, and it decays: the parent repo's symlinks break, submodule
+pointers drift, and the next engagement re-solves the same problem.
+
+Finish the loop every time:
+
+1. Land the submodule change first (merge it), then move the parent
+   repo's pointer to the merged commit in the same session.
+2. Verify the parent still composes after the merge — symlinks
+   resolve, the values stack renders.
+3. Generalize what is reusable up into the shared library
+   (`jfrog-helm-values`) and keep only the site-specific remainder
+   here. A fix worth making once for this customer is usually worth
+   making for the next.
+4. Prove behavior, do not assert it. Render before and after and diff
+   the output.
+
+Customer-specific things stay customer-specific: URLs, secret refs,
+sizing deltas, TLS. Everything else belongs upstream.
+
+```text
+# BAD
+Open a PR for the label, leave it unmerged, and hand back a customer
+repo whose helm/ symlinks only resolve while the submodule sits on a
+feature branch.
+
+# GOOD
+Merge the label, point the submodule at the merged commit, confirm the
+stack still renders, and commit the customer repo against it.
+```

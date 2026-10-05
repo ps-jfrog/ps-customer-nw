@@ -1,0 +1,47 @@
+---
+description: Read a shared tree's own rules before cross-cutting changes
+alwaysApply: true
+---
+
+# Consult the shared tree's rules first
+
+Shared trees arrive two ways. `scripts-general-util` is an **artifact
+dependency**: declared in `ps-bundle.deps.json`, materialised into
+`/scripts-general-util/` by `.envrc.d/ps_bundle_resolve` on `direnv
+reload`, and gitignored here. Others (`jfrog-helm-values`, `jpd-compose`,
+…) are still git submodules. Either way the tree owns the conventions
+for its own paths. Project-wide rules live here
+(`ps-customer-template`) and sync to customer clones.
+
+Before a change that spans this repo and a shared tree (compose labels
+plus `helm/` symlinks, sizing, OpenShift flavor, shared scripts):
+
+1. Read that tree's `.cursor/rules/` (and README / AGENTS.md) in the
+   resolved checkout.
+2. Follow those rules inside the tree. Do not copy or restate them here.
+3. Land the change in the tree's own repo, then move this repo onto it —
+   bump `version` in `ps-bundle.deps.json` for a dependency, or the
+   gitlink for a submodule.
+4. Keep customer-repo rules to glue only: `helm/` stack, site files, CI,
+   `.envrc`.
+
+Never commit content into `/scripts-general-util/`. It is gitignored
+because the manifest, not git, is what pins it — a tracked copy re-vendors
+exactly what the manifest exists to keep out.
+
+```text
+# BAD
+Edit /scripts-general-util/jf_curl in place and commit it here, or add
+compose label naming to this repo's .cursor/rules.
+
+# GOOD
+Read jfrog-helm-values/.cursor/rules/single-concern-labels.mdc, add one
+label in that submodule, then symlink it from helm/. For a script fix:
+land it in scripts-general-util, publish, then bump `version` in
+ps-bundle.deps.json and `direnv reload`.
+```
+
+A repo where `scripts-general-util` is still a gitlink has not been
+migrated. Do not paper over it — run
+`.github/scripts/migrate-from-submodules.sh` (or the **Migrate From
+Submodules** workflow) first.

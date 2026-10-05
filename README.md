@@ -2,56 +2,54 @@
 
 ## As a Customer
 
-Thanks for reading this. Here's how to download the package.
-
-Set the access token you were issued and the engagement slug suffix (the
-part after `ps-customer-`, e.g. `template` for `ps-customer-template`):
+Install the PS toolbox plugin (once), point JFrog CLI at the Professional
+Services JPD with the access token you were issued, then let toolbox pick
+the bundle your token can see:
 
 ```sh
 export JFROG_ACCESS_TOKEN=""
-export PS_BUNDLE_NAME="template"
-```
+export JFROG_CLI_PLUGINS_SERVER=ps-bundle
 
-Add the CLI profile (idempotent):
-
-```sh
 jf c add ps-bundle --overwrite --interactive=false \
   --url="https://acrois.jfrog.io/" \
   --access-token="$JFROG_ACCESS_TOKEN"
+
+jf plugin install toolbox
+jf toolbox bundle use
+. "$HOME/jfrog-ps-bundle/.envrc" -live
 ```
 
-Pick the latest published version automatically:
+`jf toolbox bundle use` lists generic `*-ps-bundles` repositories visible
+to this profile and installs the latest calver of the one prefix you can
+read. If more than one bundle is visible, pass the name:
 
 ```sh
+jf toolbox bundle list
+jf toolbox bundle use ps-customer-<slug>
+jf toolbox bundle update
+jf toolbox bundle current
+```
+
+To stay current later:
+
+```sh
+jf toolbox bundle update
+# or just check:
+jf toolbox bundle update --check
+```
+
+Without toolbox, the same download is:
+
+```sh
+export PS_BUNDLE_NAME="ps-customer-<slug>"
 export PS_BUNDLE_VERSION=$(jf rt s --server-id=ps-bundle \
-  "ps-jfrog-ps-bundles/ps-customer-${PS_BUNDLE_NAME}/*" \
+  "ps-jfrog-ps-bundles/${PS_BUNDLE_NAME}/*" \
   --include-dirs --recursive=false 2>/dev/null \
-  | jq -r ".[].path | sub(\"^ps-jfrog-ps-bundles/ps-customer-${PS_BUNDLE_NAME}/\"; \"\")" \
-  | sort -V | tail -1)
-echo "Selected: ${PS_BUNDLE_VERSION:?no versions found for ps-customer-${PS_BUNDLE_NAME}}"
-```
-
-Or list all versions and pick a specific one explicitly:
-
-```sh
-jf rt s --server-id=ps-bundle \
-  "ps-jfrog-ps-bundles/ps-customer-${PS_BUNDLE_NAME}/*" \
-  --include-dirs --recursive=false \
-  | jq -r ".[].path | sub(\"^ps-jfrog-ps-bundles/ps-customer-${PS_BUNDLE_NAME}/\"; \"\")" \
-  | sort -V
-
-export PS_BUNDLE_VERSION="v2026.19.02.5"
-```
-
-Download that version. The `(*)` / `{1}` placeholder strips the Artifactory
-prefix so the bundle's `.envrc` and `.envrc.d/` land at the target directory
-root. `--fail-no-op` makes a no-match return exit code 2 instead of a
-silent "success" with zero files:
-
-```sh
-mkdir -p ~/jfrog-ps-bundle && cd ~/jfrog-ps-bundle
+  | jq -r ".[].path | split(\"/\")[-1]" | sort -V | tail -1)
+mkdir -p ~/jfrog-ps-bundle
 jf rt dl --server-id=ps-bundle --fail-no-op=true \
-  "ps-jfrog-ps-bundles/ps-customer-${PS_BUNDLE_NAME}/${PS_BUNDLE_VERSION}/bin/(*)" "{1}"
+  "ps-jfrog-ps-bundles/${PS_BUNDLE_NAME}/${PS_BUNDLE_VERSION}/(*)" \
+  "$HOME/jfrog-ps-bundle/{1}"
 ```
 
 ## Usage
@@ -70,17 +68,66 @@ jf_curl GET /artifactory/api/repositories
 
 ## Contributing
 
-Clone this repository with submodules, or if you have cloned the repo without them, initialize them:
-
-```sh
-git submodule update --init
-```
-
 Install [direnv](https://direnv.net/).
 
 ```sh
 direnv allow
 ```
+
+Evaluating `.envrc` resolves the shared components declared in
+[ps-bundle.deps.json](ps-bundle.deps.json) before it rebuilds
+[bin/output.zip](bin/output.zip), so there is no separate clone step.
+
+### Dependencies
+
+`ps-bundle.deps.json` lists the shared bundles this repository consumes. Each
+entry names a folder in the bundle repository, pins a `version` (an exact tag,
+or the literal `latest` to take the newest published one), and picks a `target`
+directory that defaults to `deps/<name>`:
+
+```json
+{
+  "deps": [
+    {
+      "name": "scripts-general-util",
+      "version": "v0.1.0",
+      "target": "scripts-general-util"
+    }
+  ]
+}
+```
+
+To move onto a newer shared component, edit its `version` and run `direnv
+reload`. `ps_bundle_resolve --print-plan` prints what the manifest currently
+resolves to without contacting Artifactory.
+
+`scripts-general-util` used to be a git submodule; it is now materialised from
+an Artifactory bundle on `direnv reload`. A repository still on the submodule
+model needs converting before it can sync with this template — deinitialising
+the submodule by hand leaves the `.gitmodules` entry, the gitlink and the
+`.zipignore` exclusions behind, which puts the repo on both models at once.
+
+Run the **Migrate From Submodules** workflow on it (Actions → Migrate From
+Submodules → Run workflow), or do the same thing locally:
+
+```sh
+.github/scripts/migrate-from-submodules.sh --dry-run   # see the plan
+.github/scripts/migrate-from-submodules.sh --template-dir /path/to/ps-customer-template
+direnv reload
+```
+
+The conversion is idempotent and offline. Two things it deliberately does not
+do:
+
+- **Resolve the dependency.** That needs a bundle-reader token and a JFrog
+  identity mapping for the repository; without them `ps_bundle_resolve` reports
+  the dependency as missing and the `.envrc.d/*` links stay dangling.
+- **Make the next sync succeed.** Template-derived repos have unrelated
+  histories, so any file whose content has diverged — typically `.envrc`,
+  `README.md`, `.gitignore` and the bundle workflows — still merges as an
+  add/add conflict, and the sync guard aborts rather than committing markers.
+  Migrating first is what stops the repo ending up on both dependency models;
+  reconciling those files is a separate manual step.
 
 Link new scripts against the [.envrc.d](.envrc.d/):
 

@@ -2,6 +2,7 @@
 bin/*
 !bin/.gitignore
 
-# Resolver-managed dependency targets from ps-bundle.deps.json.
+# Resolver-managed dependency targets from ps-bundle.deps.json. Tracking them
+# would re-vendor into git exactly what the manifest exists to keep out.
 /scripts-general-util/
 /deps/
