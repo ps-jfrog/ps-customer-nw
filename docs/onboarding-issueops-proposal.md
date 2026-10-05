@@ -36,7 +36,8 @@ org-wide with `Repository Property 'ps_data_class' requires an explicit value`,
 and that endpoint has no parameter for custom properties. **Granting the App
 organisation administration would not fix it.** `POST /orgs/{org}/repos` does
 accept `custom_properties`, so repository creation goes through that endpoint
-and then seeds content by pushing.
+and then seeds content by pushing. **That path was replaced on 2026-10-05**
+— see "Decision, 2026-10-05" below. Do not put it back.
 
 ### Seeding by pushing the template's history, not by `generate`
 
@@ -54,6 +55,37 @@ against the template rather than merely "clean".
 
 The cost is that such a repository carries no `template_repository` marker, so
 it is named in `.github/sync-targets.json` like the other pre-marker repos.
+
+### Decision, 2026-10-05: generate from the template
+
+The seeding choice above is reversed. The repository must be created from
+`ps-jfrog/ps-customer-template`, so `template_repository.full_name` is that
+repository. Do not go back to `POST /orgs/{org}/repos` plus a history push.
+
+Re-tested the live API the same day. `custom_properties` on
+`POST /repos/{template}/generate` is not a permitted key (422). GraphQL
+`cloneTemplateRepository` has no properties input either. A generate into the
+org while `ps_data_class` has `require_explicit_values: true` returns 422
+`Could not clone: Repository Property 'ps_data_class' requires an explicit
+value to be set`, and no repository is left behind to patch. The sequence
+that both generates and satisfies the property is: clear
+`require_explicit_values`, `POST /generate` with `private: true` into the
+org, `PATCH /repos/{owner}/{repo}/properties/values` to
+`ps_data_class=Customer`, then restore the flag. The App's
+`organization_custom_properties: write` and
+`repository_custom_properties: write` are what those two writes need.
+
+The generated commit is a parentless `Initial commit`. It is not an ancestor
+of template `main` — measured on a throwaway generate, the commit has an
+empty parent list and `git merge-base` against template `main` does not
+exist — so a later sync that needs a merge base sees unrelated histories.
+That is the trade being chosen: the template marker, not a shared history.
+Do not force-push template history over the generated repository. That push
+would orphan the snapshot GitHub recorded as the template generation.
+
+Fan-out already selects repositories whose `template_repository` is this
+template, so a generated repository does not need a `.github/sync-targets.json`
+`include` entry. Repositories created before the marker still do.
 
 ### Two form fields the proposal wanted that this does not collect
 
@@ -326,26 +358,17 @@ kind of automation fails on first run:
 
 ### Seed commit
 
-The repository is created empty and seeded by pushing the template's real
-history — not with `POST /repos/{template}/generate`. Two independent reasons,
-either of which is on its own sufficient; see "Seeding by pushing the template's
-history" above for the measurement:
+Superseded by "Decision, 2026-10-05: generate from the template" above. The
+repository is created with `POST /repos/ps-jfrog/ps-customer-template/generate`,
+then `ps_data_class` is set to `Customer`. It is not created empty, and
+template history is not pushed over the generated snapshot.
 
-1. `/generate` cannot work in this organisation at all. `ps_data_class` is a
-   required org custom property with `require_explicit_values: true`, and
-   `/generate` has no parameter to supply one, so every call fails. Granting the
-   App organisation administration would not change that. `POST /orgs/{org}/repos`
-   does accept `custom_properties`.
-2. `/generate` produces a squashed `Initial commit` with no shared history, so
-   the repository has no merge base with the template and every file the
-   template later *modifies* is an add/add conflict. Measured on two local
-   repositories built to mirror each model: the `/generate` shape reports
-   `merge-base: none` and conflicts `AA` on the first modified shared file, while
-   the seeded shape has a merge base and merges clean.
-
-Because a seeded repository carries no `template_repository` marker, it must be
-added to `.github/sync-targets.json` under `include` or the fan-out will never
-discover it. The flow says so in its sticky comment.
+The paragraphs that used to live here argued for the empty-repo path because
+`/generate` 422s while `require_explicit_values` is set and because the
+Initial commit is not an ancestor of template `main`. Both facts are still
+true. The flag is cleared only for the duration of the generate call and then
+restored, and the missing merge-base is accepted so the repository keeps
+`template_repository`. Do not restore the history push.
 
 Then push one commit that turns the generic template into this customer's repo:
 
