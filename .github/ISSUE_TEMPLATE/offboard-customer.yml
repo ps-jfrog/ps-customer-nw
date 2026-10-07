@@ -24,8 +24,8 @@ body:
     attributes:
       label: Slug
       description: >-
-        The same slug used at onboarding. `bofa` retires `ps-customer-bofa`.
-      placeholder: bofa
+        The same slug used at onboarding. `contoso` retires `ps-customer-contoso`.
+      placeholder: contoso
     validations:
       required: true
 
