@@ -91,7 +91,9 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
-          set -euo pipefail
+          # pipefail would turn grep's no-match (exit 1) inside
+          # check_customer_names into a failed scan of a clean tree.
+          set -eu
           export PATH="${PWD}/scripts-general-util:${PATH}"
           source find_customer_identifiers
           source check_customer_names
