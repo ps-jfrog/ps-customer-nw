@@ -1,0 +1,38 @@
+name: Engagement expiry
+
+# Weekday check for ENGAGEMENT_ENDS. Files an offboard issue and stops.
+# github-actions is not in CODEOWNERS, so this workflow must not call
+# onboard-customer.sh and must not comment `/offboard`.
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  file:
+    name: File due offboard issues
+    if: github.repository == 'ps-jfrog/ps-customer-template'
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'standard' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/create-github-app-token@v3
+        id: app
+        continue-on-error: true
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: File issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: .github/scripts/engagement-expiry.sh

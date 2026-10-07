@@ -3,7 +3,7 @@
 # Onboard a customer engagement from an issue form. See
 # docs/onboarding-issueops-proposal.md for why each step exists.
 #
-# Usage: onboard-customer.sh <issue-number> [onboard|rollback]
+# Usage: onboard-customer.sh <issue-number> [onboard|rollback|verify|offboard|offboard-finish]
 # Env:   GH_TOKEN     token for the template repo: reads the issue, writes the
 #                     sticky comment, checks the actor's repository permission
 #        APP_TOKEN    App installation token: creates and configures the
@@ -158,7 +158,11 @@ authorize() {
 
 authorize
 
-PARSED="$("$SCRIPT_DIR/parse-onboarding-issue.py" <<<"$BODY" 2>/tmp/onboard-errors)" || {
+parse_mode=onboard
+case "$COMMAND" in
+offboard | offboard-finish) parse_mode=offboard ;;
+esac
+PARSED="$("$SCRIPT_DIR/parse-onboarding-issue.py" "$parse_mode" <<<"$BODY" 2>/tmp/onboard-errors)" || {
   fail_early "The issue form did not validate:
 
 $(sed 's/^/  /' /tmp/onboard-errors)"
@@ -190,51 +194,303 @@ app_can_reach() {
   [ "$APP_OK" = "true" ] && grep -qx "$1" <<<"$APP_REACH"
 }
 
-# ==========================================================================
-# rollback
-# ==========================================================================
-if [ "$COMMAND" = "rollback" ]; then
-  # Deliberate, never automatic. A half-created repository may already contain
-  # engagement work, and deleting that is not a decision automation gets to make.
-  if ! gh repo view "$TARGET" --json name >/dev/null 2>&1; then
-    step done "delete repository" "\`${TARGET}\` does not exist"
-  else
-    commits="$(gh api "/repos/${TARGET}/commits" --jq 'length' 2>/dev/null || echo 99)"
-    branches="$(gh api "/repos/${TARGET}/branches" --jq 'length' 2>/dev/null || echo 99)"
-    if [ "$commits" -gt 1 ] || [ "$branches" -gt 1 ]; then
-      step skipped "delete repository" \
-        "\`${TARGET}\` has ${commits} commit(s) on ${branches} branch(es) — more than the seed. Refusing to delete; do it by hand if you are sure."
-    else
-      step blocked "delete repository" \
-        "the App has no \`Administration: write\`, so it cannot delete repositories. Delete \`${TARGET}\` by hand."
-      blocker "Repository deletion needs **Repository permissions -> Administration: write** on the App."
-    fi
+# terraform.tfvars is git-crypt ciphertext. The template App must not clone
+# the bootstrap repo and edit it. Membership changes are a workflow_dispatch
+# in that repo, which unlocks, plans, and opens the pull request itself.
+dispatch_membership() {
+  local action="$1"
+  local manual="gh workflow run engagement-membership.yaml --repo ${TF_REPO} -f action=${action} -f repository=${TARGET}"
+  if [ "$DRY_RUN" = "true" ]; then
+    step skipped "membership" "would dispatch \`${action}\` for \`${TARGET}\` (dry run). Otherwise: \`${manual}\`"
+    return 0
   fi
+  if [ "$APP_OK" != "true" ] || ! app_can_reach "$TF_REPO"; then
+    step blocked "membership" "the App cannot reach \`${TF_REPO}\`. Run \`${manual}\`"
+    blocker "Install the App on \`${TF_REPO}\` and grant **Actions: write** at <https://github.com/organizations/${ORG}/settings/installations/127861359>, then run \`${manual}\`."
+    return 1
+  fi
+  local err
+  if err="$(GH_TOKEN="$APP_TOKEN" gh api --method POST \
+    "/repos/${TF_REPO}/actions/workflows/engagement-membership.yaml/dispatches" \
+    --input - <<<"$(jq -n --arg action "$action" --arg repository "$TARGET" \
+      '{ref:"main", inputs:{action:$action, repository:$repository}}')" 2>&1)"; then
+    step done "membership" "dispatched \`${action}\` for \`${TARGET}\` on \`${TF_REPO}\`. A human merges that pull request and applies it on acrois with \`TF_VAR_plugin_project=ps-jf\`."
+    return 0
+  fi
+  step blocked "membership" "could not dispatch \`${action}\`. Run \`${manual}\`"
+  blocker "Dispatch needs **Actions: write** on the App for \`${TF_REPO}\` (<https://github.com/organizations/${ORG}/settings/installations/127861359>). ${err}"
+  return 1
+}
 
-  tf_pr="$(gh pr list --repo "$TF_REPO" --state open --search "ps-customer-${SLUG} in:title" \
+# A merged add/provision pull request, with no later merged removal, is the
+# signal that this slug was applied. The template cannot read git-crypt state.
+membership_was_applied() {
+  local titles
+  titles="$(gh pr list --repo "$TF_REPO" --state merged --limit 50 --search "${TARGET} in:title" \
+    --json title --jq '.[].title' 2>/dev/null || true)"
+  if grep -q "remove ${TARGET}" <<<"$titles"; then
+    return 1
+  fi
+  grep -q -e "add ${TARGET}" -e "provision ${TARGET}" <<<"$titles"
+}
+
+close_membership_pr() {
+  local branch="$1"
+  local number
+  number="$(gh pr list --repo "$TF_REPO" --state open --head "$branch" \
     --json number --jq '.[0].number // empty' 2>/dev/null || true)"
-  if [ -n "${tf_pr:-}" ]; then
-    if [ "$DRY_RUN" = "true" ]; then
-      step skipped "close Terraform PR" "would close ${TF_REPO}#${tf_pr} (dry run)"
-    elif GH_TOKEN="${APP_TOKEN:-$GH_TOKEN}" gh pr close "$tf_pr" --repo "$TF_REPO" >/dev/null 2>&1; then
-      step done "close Terraform PR" "closed ${TF_REPO}#${tf_pr}"
-    else
-      step blocked "close Terraform PR" "cannot write to \`${TF_REPO}\`; close ${TF_REPO}#${tf_pr} by hand"
-    fi
-  else
-    step done "close Terraform PR" "no open Terraform PR for \`${SLUG}\`"
+  if [ -z "${number:-}" ]; then
+    step done "close membership PR" "no open \`${branch}\` pull request"
+    return 0
   fi
+  if [ "$DRY_RUN" = "true" ]; then
+    step skipped "close membership PR" "would close ${TF_REPO}#${number} (dry run)"
+    return 0
+  fi
+  if GH_TOKEN="${APP_TOKEN:-$GH_TOKEN}" gh pr close "$number" --repo "$TF_REPO" >/dev/null 2>&1; then
+    step done "close membership PR" "closed ${TF_REPO}#${number}"
+  else
+    step blocked "close membership PR" "cannot write to \`${TF_REPO}\`; close ${TF_REPO}#${number} by hand"
+  fi
+}
 
-  sticky "${MARKER}
-## Rollback for \`${REPO_NAME}\`
+# headline, label to add, close reason (empty leaves the issue open), footer,
+# then labels to remove.
+finish() {
+  local headline="$1" add_label="$2" close_reason="$3" footer="$4"
+  shift 4
+  local table
+  table="$(printf '%s' "$STATUS_ROWS" | while IFS='|' read -r _ s n d _; do
+    printf '| %s | %s | %s |\n' "$(icon "$(echo "$s" | tr -d ' ')")" "$n" "$d"
+  done)"
+
+  local body_out="${MARKER}
+${headline}
+
+Requested by @${ISSUE_AUTHOR}, run by @${ACTOR}$([ "$DRY_RUN" = "true" ] && echo " (**dry run** — nothing was written)").
 
 | | step | detail |
 | --- | --- | --- |
-$(printf '%s' "$STATUS_ROWS" | while IFS='|' read -r _ s n d _; do
-    printf '| %s | %s | %s |\n' "$(icon "${s// /}")" "$n" "$d"
-  done)
+${table}"
+
+  if [ -n "$BLOCKERS" ]; then
+    body_out+="
+### Needs a human
+
+$(printf '%s' "$BLOCKERS" | sed 's/^/- /')
 "
+  fi
+  body_out+="
+${footer}"
+
+  if [ "$DRY_RUN" != "true" ]; then
+    sticky "$body_out"
+    local edit_args=()
+    if [ -n "$add_label" ]; then
+      edit_args+=(--add-label "$add_label")
+    fi
+    local remove
+    for remove in "$@"; do
+      edit_args+=(--remove-label "$remove")
+    done
+    if [ "${#edit_args[@]}" -gt 0 ]; then
+      gh issue edit "$ISSUE" --repo "$TEMPLATE_REPO" "${edit_args[@]}" 2>/dev/null || true
+    fi
+    if [ -n "$close_reason" ]; then
+      gh issue close "$ISSUE" --repo "$TEMPLATE_REPO" --reason "$close_reason" >/dev/null || true
+    fi
+  else
+    echo "--- sticky comment (dry run) ---"
+    printf '%s\n' "$body_out"
+  fi
+
+  {
+    echo "$headline"
+    echo
+    echo "| | step | detail |"
+    echo "| --- | --- | --- |"
+    printf '%s\n' "$table"
+  } >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+  [ "$OVERALL" = "failed" ] && exit 1
   exit 0
+}
+
+# ==========================================================================
+# rollback — seed only. Never deletes a repository.
+# ==========================================================================
+if [ "$COMMAND" = "rollback" ]; then
+  refuse=false
+  if gh repo view "$TARGET" --json name >/dev/null 2>&1; then
+    commits="$(gh api "/repos/${TARGET}/commits" --jq 'length' 2>/dev/null || echo 99)"
+    branches="$(gh api "/repos/${TARGET}/branches" --jq 'length' 2>/dev/null || echo 99)"
+    if [ "$commits" -gt 1 ] || [ "$branches" -gt 1 ]; then
+      step failed "rollback" "\`${TARGET}\` has ${commits} commit(s) on ${branches} branch(es), more than the generated snapshot. Comment \`/offboard\`."
+      refuse=true
+    else
+      step done "repository" "\`${TARGET}\` still has only the generated commit. It is left in place."
+    fi
+  else
+    step done "repository" "\`${TARGET}\` does not exist"
+  fi
+  if membership_was_applied; then
+    step failed "rollback" "a membership pull request for \`${TARGET}\` has merged. Comment \`/offboard\`."
+    refuse=true
+  fi
+  if [ "$refuse" = "true" ]; then
+    finish "## Rollback for \`${REPO_NAME}\` — refused" "" "" \
+      "Comment \`/offboard\` to retire an engagement that has been used. Rollback does not delete repositories and does not remove a slug that was already applied." \
+      "onboarding:in-progress"
+  fi
+  close_membership_pr "onboard/${REPO_NAME}"
+  finish "## Rollback for \`${REPO_NAME}\`" "" "not planned" \
+    "The membership pull request is closed when one was open. The GitHub repository, if it exists, is left in place. Comment \`/onboard\` to resume." \
+    "onboarding:in-progress" "onboarding:failed" "onboarding:blocked"
+fi
+
+# ==========================================================================
+# verify — close the issue only after two bundle publishes
+# ==========================================================================
+# Do not dispatch jfrog-oidc-test.yaml. Its JF_PROJECT expression falls
+# through to ps-jf, which is the mapping this check exists to avoid.
+if [ "$COMMAND" = "verify" ]; then
+  if ! gh repo view "$TARGET" --json name >/dev/null 2>&1; then
+    step failed "repository" "\`${TARGET}\` does not exist"
+    finish "## Verification for \`${REPO_NAME}\` — failed" "onboarding:failed" "" \
+      "Comment \`/onboard\` first." \
+      "onboarding:in-progress" "onboarding:blocked"
+  fi
+  if GH_TOKEN="${APP_TOKEN:-$GH_TOKEN}" gh variable list --repo "$TARGET" 2>/dev/null | grep -q '^JF_PROJECT'; then
+    step failed "no JF_PROJECT" "\`JF_PROJECT\` is set on \`${TARGET}\`. Delete it before verifying."
+  else
+    step done "no JF_PROJECT" "confirmed unset"
+  fi
+
+  prove_bundle() {
+    local label="$1"
+    local since run_id log i
+    since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [ "$DRY_RUN" = "true" ]; then
+      step skipped "publish ${label}" "would dispatch jfrog-ps-bundle.yaml on \`${TARGET}\` (dry run)"
+      return 0
+    fi
+    if [ "$APP_OK" != "true" ] || ! app_can_reach "$TARGET"; then
+      step blocked "publish ${label}" "the App cannot dispatch workflows on \`${TARGET}\`"
+      blocker "Dispatching **Build JFrog PS Engagement Bundle** needs the App installed on \`${TARGET}\` with **Actions: write**."
+      return 1
+    fi
+    local err
+    if ! err="$(GH_TOKEN="$APP_TOKEN" gh api --method POST \
+      "/repos/${TARGET}/actions/workflows/jfrog-ps-bundle.yaml/dispatches" \
+      --input - <<<"$(jq -n --arg ref "$SEED_BRANCH" '{ref:$ref}')" 2>&1)"; then
+      step blocked "publish ${label}" "dispatch was refused"
+      blocker "\`POST /repos/${TARGET}/actions/workflows/jfrog-ps-bundle.yaml/dispatches\` failed (${err}). The App needs **Actions: write** on \`${TARGET}\`."
+      return 1
+    fi
+    run_id=""
+    for _ in $(seq 1 30); do
+      sleep 10
+      run_id="$(GH_TOKEN="$APP_TOKEN" gh run list --repo "$TARGET" --workflow jfrog-ps-bundle.yaml \
+        --event workflow_dispatch --limit 5 \
+        --json databaseId,createdAt --jq "[.[] | select(.createdAt >= \"${since}\")] | .[0].databaseId // empty" 2>/dev/null || true)"
+      [ -n "$run_id" ] && break
+    done
+    if [ -z "$run_id" ]; then
+      step failed "publish ${label}" "dispatch succeeded but no run appeared"
+      return 1
+    fi
+    local url="https://github.com/${TARGET}/actions/runs/${run_id}"
+    if ! GH_TOKEN="$APP_TOKEN" gh run watch "$run_id" --repo "$TARGET" --exit-status >/dev/null; then
+      step failed "publish ${label}" "run failed: ${url}"
+      return 1
+    fi
+    log="$(GH_TOKEN="$APP_TOKEN" gh run view "$run_id" --repo "$TARGET" --log 2>/dev/null || true)"
+    if ! grep -q '(downloaded)' <<<"$log"; then
+      step failed "publish ${label}" "${url} did not download scripts-general-util"
+      return 1
+    fi
+    if ! grep -q 'Build info successfully deployed' <<<"$log"; then
+      step failed "publish ${label}" "${url} did not deploy build-info"
+      return 1
+    fi
+    step done "publish ${label}" "${url} downloaded scripts-general-util and deployed build-info"
+  }
+
+  if [ "$OVERALL" != "failed" ]; then
+    prove_bundle "first" || true
+  fi
+  if [ "$OVERALL" != "failed" ] && [ "$OVERALL" != "blocked" ]; then
+    prove_bundle "second" || true
+  fi
+  if [ "$OVERALL" = "done" ]; then
+    finish "## Verification for \`${REPO_NAME}\` — passed" "onboarding:done" "completed" \
+      "Both publishes succeeded, including the second upload to the same CalVer path. That is the \`DELETE_OVERWRITE_REPOSITORY\` proof. The issue is closed." \
+      "onboarding:in-progress" "onboarding:failed" "onboarding:blocked"
+  fi
+  if [ "$OVERALL" = "blocked" ]; then
+    finish "## Verification for \`${REPO_NAME}\` — waiting on a permission" "onboarding:blocked" "" \
+      "The issue stays open. Grant the permission and comment \`/onboard-verify\` again." \
+      "onboarding:in-progress" "onboarding:failed" "onboarding:done"
+  fi
+  finish "## Verification for \`${REPO_NAME}\` — not closed" "onboarding:failed" "" \
+    "The issue stays open. Fix the failure and comment \`/onboard-verify\` again. Do not use **Test OIDC to JFrog** for this: that workflow defaults \`JF_PROJECT\` to \`ps-jf\`." \
+    "onboarding:in-progress" "onboarding:blocked" "onboarding:done"
+fi
+
+# ==========================================================================
+# offboard — dispatch the removal, then stop
+# ==========================================================================
+if [ "$COMMAND" = "offboard" ]; then
+  if [ "$REPO_NAME" = "ps-customer-template" ]; then
+    step failed "membership" "\`ps-customer-template\` is not an engagement"
+    finish "## Offboard \`${REPO_NAME}\` — refused" "" "" \
+      "This repository stays in \`ps_engagement_repos\`." \
+      "onboarding:in-progress"
+  fi
+  open_remove="$(gh pr list --repo "$TF_REPO" --state open --head "offboard/${REPO_NAME}" \
+    --json url --jq '.[0].url // empty' 2>/dev/null || true)"
+  if [ -n "${open_remove}" ]; then
+    step done "membership" "removal pull request already open: ${open_remove}"
+  else
+    dispatch_membership remove || true
+  fi
+  finish "## Offboard \`${REPO_NAME}\` — removal requested" "engagement:retiring" "" \
+    "Merge the removal pull request and apply it on acrois with \`TF_VAR_plugin_project=ps-jf\`. Published bytes under \`ps-jfrog-ps-bundles/${REPO_NAME}/\` stay. Then comment \`/offboard-finish\` to archive the GitHub repository and close this issue. \`/offboard-finish\` is the confirmation that the apply has happened." \
+    "onboarding:in-progress" "engagement:due" "onboarding:failed" "onboarding:blocked"
+fi
+
+# ==========================================================================
+# offboard-finish — archive, after a merged removal
+# ==========================================================================
+if [ "$COMMAND" = "offboard-finish" ]; then
+  merged_remove="$(gh pr list --repo "$TF_REPO" --state merged --limit 20 --search "remove ${TARGET} in:title" \
+    --json number,title | jq -r --arg needle "remove ${TARGET}" \
+    '[.[] | select(.title | contains($needle))][0].number // empty' 2>/dev/null || true)"
+  if [ -z "${merged_remove}" ]; then
+    step failed "removal merged" "no merged pull request titled \`feat: remove ${TARGET}\`. Merge and apply that change before archiving."
+    finish "## Offboard \`${REPO_NAME}\` — not archived" "engagement:retiring" "" \
+      "Archive waits until the removal pull request has merged. Apply it on acrois, then comment \`/offboard-finish\` again." \
+      "onboarding:in-progress"
+  fi
+  step done "removal merged" "${TF_REPO}#${merged_remove}"
+  if [ "$DRY_RUN" = "true" ]; then
+    step skipped "archive" "would set \`${TARGET}\` archived (dry run)"
+  elif [ "$(gh api "/repos/${TARGET}" --jq '.archived' 2>/dev/null || echo false)" = "true" ]; then
+    step done "archive" "\`${TARGET}\` is already archived"
+  elif GH_TOKEN="${APP_TOKEN:-$GH_TOKEN}" gh api --method PATCH "/repos/${TARGET}" -F archived=true >/dev/null 2>&1; then
+    step done "archive" "\`${TARGET}\` is archived. Published bundle bytes were left in place."
+  else
+    step blocked "archive" "cannot archive \`${TARGET}\`"
+    blocker "Archiving needs **Repository permissions -> Administration: write** on the App for \`${TARGET}\`."
+  fi
+  if [ "$OVERALL" = "done" ]; then
+    finish "## Offboard \`${REPO_NAME}\` — retired" "engagement:retired" "completed" \
+      "The GitHub repository is archived and this issue is closed. The bundle objects in Artifactory were not deleted." \
+      "engagement:retiring" "engagement:due" "onboarding:in-progress" "onboarding:failed" "onboarding:blocked" "onboarding:done"
+  fi
+  finish "## Offboard \`${REPO_NAME}\` — not archived" "engagement:retiring" "" \
+    "The issue stays open until the repository is archived." \
+    "onboarding:in-progress"
 fi
 
 # ==========================================================================
@@ -424,6 +680,7 @@ else
   wanted=("JF_NAME=${JF_NAME}" "JFROG_CLI_REMOTE=${JFROG_CLI_REMOTE}"
     "JFROG_CLI_VERSION=${JFROG_CLI_VERSION}" "BUNDLE_REPO=${BUNDLE_REPO}")
   [ "$RUNNER" != "ubuntu-latest" ] && wanted+=("PREFERRED_RUNNER=${RUNNER}")
+  [ -n "${ENGAGEMENT_ENDS:-}" ] && wanted+=("ENGAGEMENT_ENDS=${ENGAGEMENT_ENDS}")
 
   ok=true
   for kv in "${wanted[@]}"; do
@@ -458,161 +715,43 @@ else
   fi
 fi
 
-# --- Terraform PR --------------------------------------------------------
-TF_PR_URL=""
-tf_entry="\"${TARGET}\","
-# `.[0] | "\(.number) \(.url)"` renders "null null" for an empty list, which
-# reads as a found PR. Select the field and let jq's `// empty` do the work.
-existing_tf_pr="$(gh pr list --repo "$TF_REPO" --state open --search "ps-customer-${SLUG} in:title" \
+# --- membership ----------------------------------------------------------
+# Do not clone acrois-tf-oidc-bootstrap from here. terraform.tfvars is
+# git-crypt ciphertext; reading it as text is the UnicodeDecodeError that
+# left every onboarding issue failed. The bootstrap workflow unlocks, plans,
+# and opens the pull request. This step only dispatches it.
+existing_tf_pr="$(gh pr list --repo "$TF_REPO" --state open --head "onboard/${REPO_NAME}" \
   --json url --jq '.[0].url // empty' 2>/dev/null || true)"
-
 if [ -n "${existing_tf_pr}" ]; then
-  TF_PR_URL="${existing_tf_pr}"
-  step done "Terraform PR" "already open: ${TF_PR_URL}"
-elif [ "$DRY_RUN" = "true" ]; then
-  step skipped "Terraform PR" "would add \`${tf_entry}\` to \`ps_engagement_repos\` in \`${TF_REPO}\` (dry run)"
-elif ! app_can_reach "$TF_REPO"; then
-  step blocked "Terraform PR" "the App is not installed on \`${TF_REPO}\`"
-  blocker "Opening the Terraform PR needs the App installed on \`${TF_REPO}\`. Add it at <https://github.com/organizations/${ORG}/settings/installations> -> *JFrog PS Customer Template* -> **Repository access**. Until then, add \`${tf_entry}\` to \`ps_engagement_repos\` in \`${TF_VARS_FILE}\` by hand."
+  step done "membership" "pull request already open: ${existing_tf_pr}"
 else
-  work="$(mktemp -d)"
-  branch="onboard/${REPO_NAME}"
-  if GH_TOKEN="$APP_TOKEN" gh repo clone "$TF_REPO" "$work/tf" -- --depth 1 -q 2>/dev/null; then
-    (
-      cd "$work/tf" || exit 1
-      git config user.name 'github-actions[bot]'
-      git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-      git checkout -q -b "$branch"
-      # Insert before the closing bracket of the list, preserving the comment
-      # block that documents the scripts-general-util entry.
-      python3 - "$TF_VARS_FILE" "$TARGET" <<'PY'
-import re, sys
-path, repo = sys.argv[1], sys.argv[2]
-src = open(path).read()
-if f'"{repo}"' in src:
-    sys.exit(3)
-m = re.search(r'(ps_engagement_repos\s*=\s*\[)(.*?)(\n\])', src, re.S)
-if not m:
-    sys.exit(4)
-open(path, 'w').write(src[:m.end(2)] + f'\n  "{repo}",' + src[m.end(2):])
-PY
-      rc=$?
-      [ $rc -eq 3 ] && exit 3
-      [ $rc -ne 0 ] && exit 1
-      git commit -qam "feat: provision ${TARGET}
-
-Adds the engagement to ps_engagement_repos, which creates its group,
-bundle permission, build-info permission, OIDC identity mapping and
-shared-read membership."
-      git push -q origin "$branch"
-    )
-    case $? in
-    0)
-      TF_PR_URL="$(GH_TOKEN="$APP_TOKEN" gh pr create --repo "$TF_REPO" \
-        --title "feat: provision ${TARGET}" \
-        --head "$branch" \
-        --body "Adds \`${TARGET}\` to \`ps_engagement_repos\`, which is the whole change: the group, the bundle permission scoped to \`${SLUG}/**\`, the build-info permission, the OIDC identity mapping and shared-read membership all follow from it.
-
-Requested in ${TEMPLATE_REPO}#${ISSUE}.
-
-> [!IMPORTANT]
-> Plan and apply with \`TF_VAR_plugin_project=ps-jf\`. Without it a dozen \`toset([])\` locals collapse and the plan proposes destroying around sixty resources.
-
-Expected plan: **4 to add** (group, bundle permission, build-info permission, identity mapping) and **1 to change in place** (\`platform_permission.bundle_shared_read\` gaining the new group). Any destroy or replace means something is wrong — stop and investigate." 2>&1 | tail -n1)"
-      step done "Terraform PR" "opened ${TF_PR_URL}"
-      ;;
-    3) step done "Terraform PR" "\`${TARGET}\` is already in \`ps_engagement_repos\`" ;;
-    *)
-      step failed "Terraform PR" "could not prepare the change in \`${TF_REPO}\`"
-      ;;
-    esac
-  else
-    step blocked "Terraform PR" "cannot clone \`${TF_REPO}\` with the App token"
-    blocker "Opening the Terraform PR needs the App installed on \`${TF_REPO}\`."
-  fi
-  rm -rf "$work"
+  dispatch_membership add || true
 fi
 
-# --- verification --------------------------------------------------------
-# Deliberately not run here, and deliberately not reported as passing. The
-# repository's JFrog steps cannot work until the Terraform PR merges and
-# applies, because the identity mapping does not exist until then. A flow that
-# ran them now would show a red X that means "waiting", which is the failure
-# mode this whole document exists to avoid.
 step skipped "verification" \
-  "blocked on provisioning by design — run **Test OIDC to JFrog** and **Build JFrog PS Engagement Bundle** in \`${TARGET}\` once the Terraform PR has merged *and applied*"
+  "comment \`/onboard-verify\` after the membership pull request has been merged and applied on acrois. This command does not publish, and it does not close the issue."
 
-# --------------------------------------------------------------------------
-# Sticky comment
-# --------------------------------------------------------------------------
-TABLE="$(printf '%s' "$STATUS_ROWS" | while IFS='|' read -r _ s n d _; do
-  printf '| %s | %s | %s |\n' "$(icon "$(echo "$s" | tr -d ' ')")" "$n" "$d"
-done)"
+# The issue stays open. `/onboard-verify` is what closes it, after two publishes.
+REMAINS="Fan-out discovers this repository from \`template_repository\`. The App must be installed on \`${TARGET}\`.
+
+Merge the membership pull request in \`${TF_REPO}\` and apply it on acrois with \`TF_VAR_plugin_project=ps-jf\`. Then comment \`/onboard-verify\`. That dispatches the bundle workflow twice. The issue closes only when both succeed, including the second upload to the same path.
+
+Comment \`/onboard\` to resume a failed step. Comment \`/onboard-rollback\` only while the repository still has just the generated commit and the slug has not been applied. Comment \`/offboard\` to retire the engagement later."
 
 case "$OVERALL" in
-done) HEAD_LINE="## Onboarding \`${REPO_NAME}\` — automation complete" ;;
-blocked) HEAD_LINE="## Onboarding \`${REPO_NAME}\` — waiting on a permission" ;;
-*) HEAD_LINE="## Onboarding \`${REPO_NAME}\` — failed" ;;
+blocked)
+  finish "## Onboarding \`${REPO_NAME}\` — waiting on a permission" "onboarding:blocked" "" \
+    "$REMAINS" \
+    "onboarding:in-progress" "onboarding:failed"
+  ;;
+failed)
+  finish "## Onboarding \`${REPO_NAME}\` — failed" "onboarding:failed" "" \
+    "$REMAINS" \
+    "onboarding:in-progress" "onboarding:blocked"
+  ;;
+*)
+  finish "## Onboarding \`${REPO_NAME}\` — waiting on apply" "onboarding:in-progress" "" \
+    "$REMAINS" \
+    "onboarding:failed" "onboarding:blocked" "onboarding:done"
+  ;;
 esac
-
-BODY_OUT="${MARKER}
-${HEAD_LINE}
-
-Requested by @${ISSUE_AUTHOR}, run by @${ACTOR}$([ "$DRY_RUN" = "true" ] && echo " (**dry run** — nothing was written)").
-
-| | step | detail |
-| --- | --- | --- |
-${TABLE}"
-
-if [ -n "$BLOCKERS" ]; then
-  BODY_OUT+="
-### Needs a human
-
-$(printf '%s' "$BLOCKERS" | sed 's/^/- /')
-"
-fi
-
-BODY_OUT+="
-### What remains, always
-
-0. **Fan-out discovers this repository from \`template_repository\`.**
-   A repository generated from \`${TEMPLATE_REPO}\` does not need an
-   \`include\` entry in \`.github/sync-targets.json\`. That file is only for
-   repositories created before the marker existed. The App must be installed
-   on \`${TARGET}\` or the fan-out cannot write to it.
-1. **Review and merge the Terraform PR.** ${TF_PR_URL:-(not opened — see above)}
-2. **Wait for it to apply.** The group, bundle permission, build-info
-   permission and OIDC identity mapping do not exist until then, and nothing
-   in \`${REPO_NAME}\` that talks to JFrog can pass before they do.
-3. **Then verify**, in this order, because each step catches a different
-   failure: publish the bundle; republish over the *same* path with different
-   content (this is the one that proves the token carries
-   \`DELETE_OVERWRITE_REPOSITORY\` rather than the fallthrough
-   \`Contributor\` role); resolve \`scripts-general-util\`; publish build-info.
-
-Comment \`/onboard\` to re-run — every step is check-then-act, so it resumes
-rather than duplicating. Comment \`/onboard-rollback\` to undo an onboarding
-that has not been used yet."
-
-if [ "$DRY_RUN" != "true" ]; then
-  sticky "$BODY_OUT"
-  case "$OVERALL" in
-  done) gh issue edit "$ISSUE" --repo "$TEMPLATE_REPO" --add-label "onboarding:done" --remove-label "onboarding:in-progress" 2>/dev/null || true ;;
-  blocked) gh issue edit "$ISSUE" --repo "$TEMPLATE_REPO" --add-label "onboarding:blocked" --remove-label "onboarding:in-progress" 2>/dev/null || true ;;
-  *) gh issue edit "$ISSUE" --repo "$TEMPLATE_REPO" --add-label "onboarding:failed" --remove-label "onboarding:in-progress" 2>/dev/null || true ;;
-  esac
-else
-  echo "--- sticky comment (dry run) ---"
-  printf '%s\n' "$BODY_OUT"
-fi
-
-{
-  echo "$HEAD_LINE"
-  echo
-  echo "| | step | detail |"
-  echo "| --- | --- | --- |"
-  printf '%s\n' "$TABLE"
-} >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
-
-[ "$OVERALL" = "failed" ] && exit 1
-exit 0

@@ -147,6 +147,19 @@ jobs:
             <(printf '%s\n' "$exclude" | grep . || true) \
             | grep -v "^${TEMPLATE_REPO}$" || true)
 
+          # An archived engagement has been retired. Sync pull requests against
+          # it would reopen a repository nobody is applying.
+          active=""
+          while IFS= read -r repo; do
+            [ -n "$repo" ] || continue
+            if [ "$(gh api "/repos/${repo}" --jq '.archived' 2>/dev/null || echo false)" = "true" ]; then
+              echo "::notice::skipping archived ${repo}"
+              continue
+            fi
+            active+="${repo}"$'\n'
+          done <<<"$targets"
+          targets="$active"
+
           # Naming an unreachable repository is an error worth surfacing now
           # rather than as thirteen identical clone failures later.
           unreachable=$(comm -23 <(printf '%s\n' "$targets" | grep . || true) "${RUNNER_TEMP}/reachable.txt" || true)
