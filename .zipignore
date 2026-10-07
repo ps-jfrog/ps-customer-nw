@@ -7,3 +7,11 @@ bin/output.zip
 *.DS_Store
 output.zip
 .*ignore
+scripts-general-util
+scripts-general-util/*
+docs/*.md
+.cursor
+.cursor/*
+.github
+.github/*
+.tool-versions
