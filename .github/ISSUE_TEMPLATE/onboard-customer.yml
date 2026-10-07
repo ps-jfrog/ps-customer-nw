@@ -6,8 +6,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        Filing this issue creates a repository and opens a Terraform pull
-        request. Only members of **PS-US-Engineering** listed in `CODEOWNERS`
+        Filing this issue creates a repository and dispatches a membership
+        change in `acrois-tf-oidc-bootstrap`. Only members of **PS-US-Engineering** listed in `CODEOWNERS`
         can run it — anyone may file the request, but the automation checks
         who triggered it, not who wrote it.
 
@@ -30,10 +30,10 @@ body:
       description: >-
         Lowercase letters, digits and hyphens, 2-29 characters, starting with a
         letter or digit. The repository becomes `ps-customer-<slug>`, so a slug
-        of `bofa` produces `ps-customer-bofa`. The same string becomes the
+        of `acme` produces `ps-customer-acme`. The same string becomes the
         Artifactory group name and the `<slug>/**` bundle path, so anything
         outside `[a-z0-9-]` produces an unusable group.
-      placeholder: bofa
+      placeholder: acme
     validations:
       required: true
 
@@ -102,6 +102,18 @@ body:
     attributes:
       label: Customer technical contact
       description: Recorded on this issue only. Nothing reads it.
+    validations:
+      required: false
+
+  - type: input
+    id: ends_on
+    attributes:
+      label: Engagement end date
+      description: >-
+        Optional. YYYY-MM-DD. Stored as the repository variable ENGAGEMENT_ENDS.
+        On that date a weekday job files an offboard issue. It does not remove
+        access and it does not archive the repository.
+      placeholder: 2027-04-01
     validations:
       required: false
 
