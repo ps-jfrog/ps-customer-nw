@@ -1,0 +1,41 @@
+name: Offboard a customer engagement
+description: Remove JFrog access for a ps-customer-* repository and archive it.
+title: 'offboard: ps-customer-<slug>'
+labels: [engagement:due]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Filing this issue does not remove anything by itself. Comment `/offboard`
+        to open the removal pull request in `acrois-tf-oidc-bootstrap`. After
+        that pull request is merged and applied, comment `/offboard-finish` to
+        archive the GitHub repository.
+
+        The same commands work on the original onboarding issue. Published
+        bundle bytes are left in Artifactory. `ps-customer-template` and
+        shared-component repositories cannot be removed this way.
+
+        Anyone may file the request. The automation checks who commented
+        `/offboard`, and that person must have write on this repository and be
+        listed in `CODEOWNERS`.
+
+  - type: input
+    id: slug
+    attributes:
+      label: Slug
+      description: >-
+        The same slug used at onboarding. `bofa` retires `ps-customer-bofa`.
+      placeholder: bofa
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: >-
+            I understand this removes the engagement from ps_engagement_repos
+            after a reviewed apply, then archives the GitHub repository, and
+            does not delete published bundle bytes.
+          required: true
