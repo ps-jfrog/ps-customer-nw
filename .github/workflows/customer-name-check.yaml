@@ -1,0 +1,102 @@
+name: Customer Identifier Check
+
+# Scans this repository - the shared template every ps-customer-* engagement
+# is derived from - for real customer identifiers. A leak here is the worst
+# place for one: fan-out sync propagates whatever is in this tree into every
+# derived repository.
+#
+# The identifier list is discovered live from GitHub (find_customer_identifiers
+# in scripts-general-util), not hand-maintained: every ps-customer-* repository
+# in the org, cross-checked against the ps_data_class=Customer custom property.
+# That discovery needs org-wide read reach this repository's own GITHUB_TOKEN
+# does not have, which is why this mints the same App token onboarding and
+# fan-out sync use - the only credential in the fleet with that reach.
+#
+# scripts-general-util itself is resolved the same way every derived repo
+# resolves it - ps_bundle_resolve materialising the ps-bundle.deps.json entry
+# from Artifactory - not a git clone. That is what needs the JFrog CLI setup
+# below; it never writes anything, only reads the published dependency.
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - "**"
+
+env:
+  JF_URL: ${{ secrets.JF_URL || vars.JF_URL || format(secrets.JF_WORKSPACE_BASE_URL || vars.JF_WORKSPACE_BASE_URL || 'https://{0}.jfrog.io/', secrets.JF_NAME || vars.JF_NAME) }}
+  JF_PROJECT: ${{ secrets.JF_PROJECT || vars.JF_PROJECT || '' }}
+  JF_OIDC_AUDIENCE: ${{ secrets.JF_OIDC_AUDIENCE || vars.JF_OIDC_AUDIENCE || format('{0}/{1}', github.server_url, github.repository_owner) }}
+  JF_OIDC_PROVIDER: ${{ secrets.JF_OIDC_PROVIDER || vars.JF_OIDC_PROVIDER || 'ghc-ps-jfrog' }}
+  JFROG_CLI_VERSION: ${{ vars.JFROG_CLI_VERSION || 'latest' }}
+  JFROG_CLI_LOG_TIMESTAMP: DATE_AND_TIME
+  JFROG_CLI_LOG_LEVEL: ${{ vars.JFROG_CLI_LOG_LEVEL || 'INFO' }}
+  JFROG_CLI_ENCRYPTION_KEY: ${{ secrets.JFROG_CLI_ENCRYPTION_KEY || 'ThisIsNotSecureSoSetTheValueNow0' }}
+  JFROG_CLI_REMOTE: ${{ secrets.JFROG_CLI_REMOTE || vars.JFROG_CLI_REMOTE || 'jfrog-cli-remote' }}
+  JFROG_CLI_PLUGINS_SERVER: ${{ secrets.JFROG_CLI_PLUGINS_SERVER || vars.JFROG_CLI_PLUGINS_SERVER || 'setup-jfrog-cli-server' }}
+  BUNDLE_REPO: "${{ secrets.BUNDLE_REPO || vars.BUNDLE_REPO || (secrets.JF_PROJECT || vars.JF_PROJECT || '') && format('{0}-ps-bundles', secrets.JF_PROJECT || vars.JF_PROJECT || '') || '' }}"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  check:
+    name: Scan for customer identifiers
+    runs-on: ${{ vars.PREFERRED_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Read-only: no step-level JF_PROJECT override, same reasoning as
+      # share-ps-bundle.yaml's Setup step - this never uploads anything.
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        with:
+          version: ${{ env.JFROG_CLI_VERSION }}
+          oidc-provider-name: ${{ env.JF_OIDC_PROVIDER }}
+          oidc-audience: ${{ env.JF_OIDC_AUDIENCE }}
+          download-repository: ${{ env.JFROG_CLI_REMOTE }}
+          custom-server-id: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-bundle-reader
+
+      - name: Resolve scripts-general-util
+        env:
+          JFROG_CLI_SERVER_ID: ${{ env.JFROG_CLI_PLUGINS_SERVER }}-bundle-reader
+        run: .envrc.d/ps_bundle_resolve
+
+      - uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      # The exclusions below are not a loophole - they're the files whose
+      # whole job is to name real engagements, and would otherwise fail
+      # this check on every push regardless of any new leak:
+      #   sync-targets.json   the literal fan-out target registry
+      #   onboard-customer.sh comments explaining real historical fixes,
+      #                       measured against real engagements by name
+      #   CODEOWNERS          currently clean, listed for when it isn't
+      #   docs/*.md           runbooks/proposals analysing real migrations
+      # Anything else in this tree - including new docs added outside
+      # docs/*.md - is still scanned and still fails the check.
+      - name: Discover identifiers and scan this tree
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          export PATH="${PWD}/scripts-general-util:${PATH}"
+          source find_customer_identifiers
+          source check_customer_names
+          find_customer_identifiers | check_customer_names \
+            --exclude '.github/sync-targets.json' \
+            --exclude '.github/scripts/onboard-customer.sh' \
+            --exclude '.github/CODEOWNERS' \
+            --exclude 'docs/*.md'

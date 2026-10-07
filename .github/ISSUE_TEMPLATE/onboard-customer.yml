@@ -30,10 +30,10 @@ body:
       description: >-
         Lowercase letters, digits and hyphens, 2-29 characters, starting with a
         letter or digit. The repository becomes `ps-customer-<slug>`, so a slug
-        of `bofa` produces `ps-customer-bofa`. The same string becomes the
+        of `acme` produces `ps-customer-acme`. The same string becomes the
         Artifactory group name and the `<slug>/**` bundle path, so anything
         outside `[a-z0-9-]` produces an unusable group.
-      placeholder: bofa
+      placeholder: acme
     validations:
       required: true
 
