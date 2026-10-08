@@ -3,7 +3,7 @@
   "deps": [
     {
       "name": "scripts-general-util",
-      "version": "v2026.41.02",
+      "version": "v2026.41.04.3",
       "target": "scripts-general-util"
     }
   ]
