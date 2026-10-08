@@ -34,7 +34,10 @@ DESCRIPTION
     version to <target>/.ps-bundle-version; a later run whose requested
     version matches that sentinel skips the download. A "latest" dep is
     re-resolved on every run, but still skips the download when the
-    resolved version matches the sentinel.
+    resolved version matches the sentinel. The sentinel does not mean the
+    files are unmodified: the target is gitignored, so edits there are
+    invisible to git status. --diff compares the working target with a
+    fresh copy of the published bundle.
 
     Downloaded files get the executable bit restored, because the exploded
     upload (jf rt u --explode) drops the Unix mode server-side.
@@ -50,6 +53,8 @@ OPTIONS
     --print-plan      Print the resolved name/version/target triples, tab
                       separated, and exit without downloading. No server
                       is contacted, so "latest" is printed unresolved.
+    --diff            Compare each materialised target with the published
+                      bundle. Exit 1 when they differ.
 
 ENVIRONMENT
     BUNDLE_REPO       Source Artifactory repository
@@ -65,12 +70,15 @@ EXAMPLES
     # Show what would be resolved, without contacting Artifactory
     ps_bundle_resolve --print-plan
 
+    # Show local edits that are not in the published bundle
+    ps_bundle_resolve --diff
+
     # Resolve against an explicit repository
     BUNDLE_REPO=ps-jfrog-ps-bundles ps_bundle_resolve
 
 EXIT STATUS
-    0  Success, or nothing to do
-    1  Error occurred
+    0  Success, or nothing to do. --diff: working tree matches the published bundle
+    1  Error occurred. --diff: a target differs from the published bundle
     2  Invalid arguments
 
 SEE ALSO
@@ -196,13 +204,132 @@ help
         printf '%s\n' "$path"
     }
 
-    local manifest bundle_repo server_id print_plan=0 status=0
+    # Artifact properties carry the source commit the bundle was built from.
+    _ps_bundle_published_revision() {
+        local repo="$1" name="$2" version="$3" server_id="${4:-}"
+        local search_args=(rt s "${repo%/}/${name}/${version}/bin/*" --limit=1)
+        local found
+
+        if [ -n "$server_id" ]; then
+            search_args+=(--server-id="$server_id")
+        fi
+
+        found="$(jf "${search_args[@]}" 2>/dev/null | jq -r 'first(.[]?.props["vcs.revision"][]?) // empty')" || return 1
+        [ -n "$found" ] || return 1
+        printf '%s\n' "$found"
+    }
+
+    # diff -rq lines name absolute paths. Restate them against the two roots.
+    _ps_bundle_relabel_diff() {
+        local published="$1" working="$2" line rel
+
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in
+                "Only in ${published}"*)
+                    rel="${line#Only in ${published}}"
+                    rel="${rel#/}"
+                    rel="${rel#: }"
+                    rel="${rel/: /\/}"
+                    printf 'only published: %s\n' "$rel"
+                    ;;
+                "Only in ${working}"*)
+                    rel="${line#Only in ${working}}"
+                    rel="${rel#/}"
+                    rel="${rel#: }"
+                    rel="${rel/: /\/}"
+                    printf 'only local: %s\n' "$rel"
+                    ;;
+                Files\ *)
+                    rel="${line#Files }"
+                    rel="${rel%% and *}"
+                    rel="${rel#"${published}/"}"
+                    printf 'modified: %s\n' "$rel"
+                    ;;
+                *)
+                    printf '%s\n' "$line"
+                    ;;
+            esac
+        done
+    }
+
+    _ps_bundle_diff_target() {
+        local name="$1" resolved="$2" target="$3" bundle_repo="$4" server_id="${5:-}"
+        local tmp download_log revision="" diff_out rel
+        local server_args=()
+
+        if [ -n "$server_id" ]; then
+            server_args+=(--server-id="$server_id")
+        fi
+
+        target="${target%/}"
+        if [ ! -d "$target" ]; then
+            echo "Error: ${name} ${resolved} is not materialised at ${target}/" >&2
+            return 1
+        fi
+
+        local tmp_root="${TMPDIR:-/tmp}"
+        tmp_root="${tmp_root%/}"
+        tmp="$(mktemp -d "${tmp_root}/ps-bundle-diff.XXXXXX")" || return 1
+
+        if ! download_log="$(jf rt dl \
+            "${bundle_repo%/}/${name}/${resolved}/bin/(*)" \
+            "${tmp}/{1}" \
+            --flat=false \
+            --fail-no-op=true \
+            ${server_args[@]+"${server_args[@]}"} 2>&1)"; then
+            printf '%s\n' "$download_log" >&2
+            echo "Error: failed to download ${name} ${resolved} from ${bundle_repo} for comparison." >&2
+            rm -rf "$tmp"
+            return 1
+        fi
+
+        revision="$(_ps_bundle_published_revision "$bundle_repo" "$name" "$resolved" "$server_id" || true)"
+
+        diff_out="$(diff -rq -x '.ps-bundle-version' -x '.DS_Store' "$tmp" "$target" || true)"
+        if [ -z "$diff_out" ]; then
+            if [ -n "$revision" ]; then
+                printf '%s %s -> %s/ (matches published %s)\n' "$name" "$resolved" "$target" "$revision"
+            else
+                printf '%s %s -> %s/ (matches published)\n' "$name" "$resolved" "$target"
+            fi
+            rm -rf "$tmp"
+            return 0
+        fi
+
+        echo "${name} ${resolved} -> ${target}/ differs from the published bundle"
+        if [ -n "$revision" ]; then
+            echo "Published from vcs.revision ${revision}"
+            echo "Source: https://github.com/ps-jfrog/${name}/commit/${revision}"
+        fi
+        printf '%s\n' "$diff_out" | _ps_bundle_relabel_diff "$tmp" "$target"
+        echo "Working tree edits under ${target}/ are gitignored."
+        echo "Land them in the source repository, publish, then bump version in ps-bundle.deps.json."
+
+        # Show the text of modified files. Added and removed paths are listed above.
+        while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            [ -f "${tmp}/${rel}" ] && [ -f "${target}/${rel}" ] || continue
+            echo "--- ${rel} ---"
+            diff -u "${tmp}/${rel}" "${target}/${rel}" || true
+        done <<files
+$(printf '%s\n' "$diff_out" | _ps_bundle_relabel_diff "$tmp" "$target" | sed -n 's/^modified: //p')
+files
+
+        rm -rf "$tmp"
+        return 1
+    }
+
+    local manifest bundle_repo server_id print_plan=0 diff_mode=0 status=0
     local name version target resolved cached download_log
     local server_args=()
 
     case "${1:-}" in
         --print-plan)
             print_plan=1
+            ;;
+        --diff)
+            diff_mode=1
             ;;
         "")
             ;;
@@ -262,6 +389,13 @@ help
                 status=1
                 continue
             }
+        fi
+
+        if [ "$diff_mode" -eq 1 ]; then
+            if ! _ps_bundle_diff_target "$name" "$resolved" "$target" "$bundle_repo" "$server_id"; then
+                status=1
+            fi
+            continue
         fi
 
         cached="$(_ps_bundle_sentinel_version "$target")" || cached=""
@@ -333,7 +467,8 @@ jf rt s.
 
 Resolution is idempotent. A successful download writes the resolved version to
 <target>/.ps-bundle-version, and a later run whose requested version matches that
-sentinel skips the download.
+sentinel skips the download. The sentinel does not mean the files are unmodified.
+\-\-diff compares the working target with a fresh copy of the published bundle.
 
 If ps-bundle.deps.json is absent the command is a silent no-op. If jq, jf, or a
 usable JFrog server configuration is missing, a warning goes to stderr and the
@@ -350,6 +485,9 @@ Display manpage
 .BR \-\-print-plan
 Print the resolved name/version/target triples, tab separated, and exit without
 downloading
+.TP
+.BR \-\-diff
+Compare each materialised target with the published bundle. Exit 1 when they differ.
 
 .SH ENVIRONMENT
 .TP
@@ -376,16 +514,19 @@ Resolve every declared dependency
 ps_bundle_resolve \-\-print-plan
 Show what would be resolved, without contacting Artifactory
 .TP
+ps_bundle_resolve \-\-diff
+Show local edits that are not in the published bundle
+.TP
 BUNDLE_REPO=ps-jfrog-ps-bundles ps_bundle_resolve
 Resolve against an explicit repository
 
 .SH EXIT STATUS
 .TP
 .B 0
-Success, or nothing to do
+Success, or nothing to do. \-\-diff: working tree matches the published bundle
 .TP
 .B 1
-Error occurred
+Error occurred. \-\-diff: a target differs from the published bundle
 .TP
 .B 2
 Invalid arguments
