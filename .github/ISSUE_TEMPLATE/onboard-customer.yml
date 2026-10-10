@@ -113,7 +113,7 @@ body:
         Optional. YYYY-MM-DD. Stored as the repository variable ENGAGEMENT_ENDS.
         On that date a weekday job files an offboard issue. It does not remove
         access and it does not archive the repository.
-      placeholder: 2027-04-01
+      placeholder: '2027-04-01'
     validations:
       required: false
 
