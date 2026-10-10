@@ -105,6 +105,11 @@ jobs:
       - name: Discover identifiers and scan this tree
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          # Real customer names and aliases, one per line, for engagements whose
+          # repository name is an opaque Salesforce ID and so cannot be
+          # discovered from the org. Optional: absent or empty means the scan
+          # runs on repository-name discovery alone.
+          PS_CUSTOMER_NAMES: ${{ secrets.PS_CUSTOMER_NAMES }}
         run: |
           # pipefail would turn grep's no-match (exit 1) inside
           # check_customer_names into a failed scan of a clean tree.
@@ -112,7 +117,16 @@ jobs:
           export PATH="${PWD}/scripts-general-util:${PATH}"
           source find_customer_identifiers
           source check_customer_names
-          find_customer_identifiers | check_customer_names \
+          # A matching line is printed on failure. Register each name as a mask
+          # first so Actions redacts it from the log.
+          while IFS= read -r name; do
+            name="${name%$'\r'}"
+            [ -n "$name" ] || continue
+            echo "::add-mask::${name}"
+          done <<<"${PS_CUSTOMER_NAMES:-}"
+          { find_customer_identifiers || true; printf '%s\n' "${PS_CUSTOMER_NAMES:-}"; } \
+            | grep -v '^[[:space:]]*$' \
+            | check_customer_names \
             --exclude '.github/sync-targets.json' \
             --exclude '.github/scripts/onboard-customer.sh' \
             --exclude '.github/CODEOWNERS' \
