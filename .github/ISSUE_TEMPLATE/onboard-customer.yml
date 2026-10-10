@@ -15,27 +15,27 @@ body:
         comment is the run's state: re-running resumes from it.
 
   - type: input
-    id: customer_name
+    id: account_id
     attributes:
-      label: Customer name
-      description: How the customer is referred to in writing. Used for the repository description.
-      placeholder: Bank of America
+      label: Salesforce Account ID
+      description: >-
+        The customer's Salesforce Account ID (15 or 18 characters, starts with
+        `001`). It becomes the repository name, `ps-customer-<account-id>`, and
+        the Artifactory group and `<account-id>/**` bundle path. Do not type the
+        customer's name anywhere in this issue.
+      placeholder: 001000000000000AAA
     validations:
       required: true
 
   - type: input
-    id: slug
+    id: project_id
     attributes:
-      label: Slug
+      label: Project ID
       description: >-
-        Lowercase letters, digits and hyphens, 2-29 characters, starting with a
-        letter or digit. The repository becomes `ps-customer-<slug>`, so a slug
-        of `acme` produces `ps-customer-acme`. The same string becomes the
-        Artifactory group name and the `<slug>/**` bundle path, so anything
-        outside `[a-z0-9-]` produces an unusable group.
-      placeholder: acme
+        Optional. The Salesforce project ID this engagement starts with, recorded
+        on this issue. Projects live as folders inside the repository.
     validations:
-      required: true
+      required: false
 
   - type: dropdown
     id: visibility
@@ -101,7 +101,7 @@ body:
     id: contact
     attributes:
       label: Customer technical contact
-      description: Recorded on this issue only. Nothing reads it.
+      description: Optional. Recorded on this issue only; nothing reads it. Prefer a role or a Salesforce Contact ID to a person's name.
     validations:
       required: false
 
