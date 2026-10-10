@@ -1,7 +1,12 @@
 # Anonymizing customer identifiers
 
-Status: proposal. Nothing here is applied. This describes the target, the order
-of work, and the runbook for renaming the existing engagement repositories.
+Status: decided, being built in phases. This describes the target, the order of
+work, and the runbook for renaming the existing engagement repositories.
+
+Decisions taken: one bundle per account; no validation on the project entity ID;
+the Salesforce map is maintained by hand for now; **no organization-level
+secrets** (the org is on the free plan); existing history is **accepted as it
+is** and addressed going forward.
 
 ## Goal
 
@@ -48,10 +53,8 @@ Validation: `^001[a-z0-9]{15}$` (Account IDs start `001`). The current slug rule
 `<slug>/**` patterns need no widening.
 
 A project ID is the custom entity's ID. It is recorded in the map and as a
-folder name; it is not part of the repository or group name. If a project ever
-needs its own bundle or its own permission, the bundle path becomes
-`<account-id>/<project-id>/…` and the group pattern follows. That is a separate
-decision, not required to start.
+folder name; it is not part of the repository or group name, and it is not
+validated. There is one bundle per account.
 
 ## The map
 
@@ -77,8 +80,7 @@ Aliases matter: the scan needs every string a person might type, not only the
 legal name. Names short enough to be ordinary words need the same care the
 current `--min-length` rule gives bare slugs.
 
-The file is produced by an export from Salesforce and committed by a reviewed PR.
-Who can decrypt is whoever holds the git-crypt key for that repository, which is
+For now the file is maintained by hand. Who can decrypt is whoever holds the git-crypt key for that repository, which is
 already a small, controlled set. The template and the customer repositories
 never hold that key.
 
@@ -90,22 +92,23 @@ catching the real names in text. It becomes weaker, silently. The name list has
 to come from the map.
 
 The scan runs in the template and in every derived repository, none of which may
-hold the git-crypt key. Proposed: a job in `acrois-tf-oidc-bootstrap` unlocks the
-map, derives a flat list of names and aliases, and writes it to an organization
-Actions secret `PS_CUSTOMER_NAMES` scoped to the template and the engagement
-repositories. `customer-name-check.yaml` reads the secret instead of calling
-GitHub for repository names.
+hold the git-crypt key. Organization secrets are not available on this plan, so
+the flat name list (names and aliases, one per line) is a **repository secret**,
+`PS_CUSTOMER_NAMES`, set on the template and on each engagement repository.
+`customer-name-check.yaml` reads it instead of relying only on GitHub repository
+names. Until a sync job exists the secret is set by hand from the decrypted map;
+the customer-template App already has repository-secret write, so a job in
+`acrois-tf-oidc-bootstrap` can later push it to every engagement repository.
 
 Trade-offs to accept knowingly:
 
 - Anyone who can add a workflow to a repository that holds the secret can read it,
   as with any secret. Engagement repositories are private and write access is
   already limited.
-- The secret holds plaintext names, so it must never be echoed. Masking is
-  automatic for secrets but not for substrings; the scan must not print the
-  matched name, only the file and line.
-- The org-secret write needs the App's organization secrets permission. Confirm
-  before relying on it.
+- The scan prints the matching line on failure, so each name is registered with
+  `::add-mask::` first and Actions redacts it.
+- A repository without the secret scans on repository-name discovery alone. That
+  is the current behaviour, so adding the secret only ever widens the scan.
 
 During the transition the scan reads the **union** of the secret and today's
 `ps-customer-*` discovery, so nothing is lost while repositories are renamed.
@@ -161,8 +164,8 @@ deleted.
 
 | Phase | Where | Change |
 | --- | --- | --- |
-| 0 | `acrois-tf-oidc-bootstrap` | `customer-map/` under git-crypt; job that derives `PS_CUSTOMER_NAMES` |
-| 1 | template | scan reads the secret, union with current discovery |
+| 0 | `acrois-tf-oidc-bootstrap` | `customer-map/` under git-crypt (hand-maintained); `PS_CUSTOMER_NAMES` set by hand on the template and engagement repos |
+| 1 | template | scan reads the secret, union with current discovery (PR #35) |
 | 2 | template | onboarding form and parser take an Account ID; new engagements use it |
 | 3 | per repository | rename runbook above, rehearsal first |
 | 4 | everywhere | scan history for old names; decide rewrite versus accept; drop the scan's path exclusions that exist only because real names appeared in docs |
@@ -172,12 +175,8 @@ during the move.
 
 ## Open questions
 
-1. Is a bundle per project needed, or is one bundle per account enough?
-2. The format of the project entity's ID, and whether it needs validating.
-3. Who owns the Salesforce export and how often it runs. A stale map is a
-   scan that misses a newly signed customer.
-4. Whether the App may write organization secrets, or whether the secret is
-   set by hand.
-5. Whether to rewrite history to remove old names, accept it, or archive and
-   replace the oldest repositories. Rewriting history breaks every clone and
-   open pull request.
+1. Who refreshes `PS_CUSTOMER_NAMES` on each repository when the map changes, until
+   a sync job exists. A stale secret is a scan that misses a newly signed customer.
+2. Whether the App is granted repository-secret write on the engagement
+   repositories, so a job can replace the by-hand step.
+3. History is accepted as it is. Revisit if a customer or contract requires it.
