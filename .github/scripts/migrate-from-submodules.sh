@@ -101,9 +101,26 @@ if [ -f .zipignore ] && grep -qxE "${NAME}(/\*)?[[:space:]]*" .zipignore; then
   fi
 fi
 
-# 5. Declare the dependency. An existing manifest is left alone - its pins are
-#    the customer's, not ours.
-if [ ! -f ps-bundle.deps.json ]; then
+# 5. Declare the dependency. An existing manifest keeps every pin it already
+#    has - those are the customer's, not ours - but a name it does not list yet
+#    is appended, so a repo that migrated one gitlink can take the next through
+#    this same script.
+if [ -f ps-bundle.deps.json ]; then
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq is required to update the existing ps-bundle.deps.json" >&2
+    exit 1
+  fi
+  if ! jq -e --arg n "$NAME" '[.deps[]? | select(.name == $n)] | length > 0' \
+    ps-bundle.deps.json >/dev/null; then
+    if act "append ${NAME}@${VERSION} to ps-bundle.deps.json"; then
+      jq --arg n "$NAME" --arg v "$VERSION" \
+        '.deps = ((.deps // []) + [{name: $n, version: $v, target: $n}])' \
+        ps-bundle.deps.json >ps-bundle.deps.json.tmp
+      mv ps-bundle.deps.json.tmp ps-bundle.deps.json
+      git add ps-bundle.deps.json
+    fi
+  fi
+else
   if act "add ps-bundle.deps.json pinning ${NAME}@${VERSION}"; then
     if [ -n "$TEMPLATE_DIR" ] && [ -f "${TEMPLATE_DIR}/ps-bundle.deps.json" ]; then
       cp "${TEMPLATE_DIR}/ps-bundle.deps.json" ps-bundle.deps.json
