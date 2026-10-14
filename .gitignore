@@ -1,6 +1,7 @@
 .DS_Store
 bin/*
 !bin/.gitignore
+internal/
 
 # Resolver-managed dependency targets from ps-bundle.deps.json. Tracking them
 # would re-vendor into git exactly what the manifest exists to keep out.
